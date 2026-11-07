@@ -537,6 +537,10 @@ pub enum SessionListUpdate {
         session_id: acp_v2::SessionId,
         update: AgentSessionInfoUpdate,
     },
+    /// The agent reported that it no longer has this session.
+    SessionRemoved {
+        session_id: acp_v2::SessionId,
+    },
 }
 
 pub trait AgentSessionList {
@@ -560,6 +564,12 @@ pub trait AgentSessionList {
 
     fn watch(&self, _cx: &mut App) -> Option<async_channel::Receiver<SessionListUpdate>> {
         None
+    }
+
+    /// Whether the agent pushes changes to its session list, so that watchers
+    /// don't need to poll it.
+    fn notifies_changes(&self) -> bool {
+        false
     }
 
     fn notify_refresh(&self) {}

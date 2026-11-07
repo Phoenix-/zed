@@ -871,6 +871,14 @@ pub enum CustomAgentServerSettings {
         /// Default: {}
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         favorite_config_option_values: HashMap<String, Vec<String>>,
+        /// Whether to keep this agent's sessions in sync with the threads sidebar:
+        /// sessions created outside of Zed appear as threads, and threads disappear
+        /// when the agent removes their sessions.
+        ///
+        /// Requires the agent to support listing sessions.
+        ///
+        /// Default: false
+        auto_import_sessions: Option<bool>,
     },
     // Used for the ACP extension migration
     #[serde(alias = "extension")]
@@ -900,6 +908,14 @@ pub enum CustomAgentServerSettings {
         /// Default: {}
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         favorite_config_option_values: HashMap<String, Vec<String>>,
+        /// Whether to keep this agent's sessions in sync with the threads sidebar:
+        /// sessions created outside of Zed appear as threads, and threads disappear
+        /// when the agent removes their sessions.
+        ///
+        /// Requires the agent to support listing sessions.
+        ///
+        /// Default: false
+        auto_import_sessions: Option<bool>,
     },
 }
 

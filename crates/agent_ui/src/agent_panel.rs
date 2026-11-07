@@ -7032,6 +7032,7 @@ mod tests {
                         default_mode: None,
                         default_config_options: Default::default(),
                         favorite_config_option_values: Default::default(),
+                        auto_import_sessions: None,
                     },
                 );
             });

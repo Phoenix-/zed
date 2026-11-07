@@ -25,6 +25,7 @@ mod model_search;
 mod model_selector;
 mod model_selector_popover;
 mod profile_selector;
+mod session_auto_import;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;
@@ -712,6 +713,7 @@ pub fn init(
     agent_panel::init(cx);
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
+    session_auto_import::init(cx);
     terminal_thread_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);

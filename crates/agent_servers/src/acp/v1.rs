@@ -50,6 +50,9 @@ use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
 use crate::{CURSOR_ID, GEMINI_ID};
 
+mod session_list_changes;
+use session_list_changes::handle_sessions_changed;
+
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 async fn close_session_and_drain(
@@ -239,6 +242,7 @@ impl ConfigOptions {
 pub struct AcpSessionList {
     connection: ConnectionTo<Agent>,
     supports_delete: bool,
+    notifies_changes: bool,
     updates_tx: async_channel::Sender<acp_thread::SessionListUpdate>,
     updates_rx: async_channel::Receiver<acp_thread::SessionListUpdate>,
 }
@@ -249,6 +253,7 @@ impl AcpSessionList {
         Self {
             connection,
             supports_delete,
+            notifies_changes: false,
             updates_tx: tx,
             updates_rx: rx,
         }
@@ -343,6 +348,10 @@ impl AgentSessionList for AcpSessionList {
         _cx: &mut App,
     ) -> Option<async_channel::Receiver<acp_thread::SessionListUpdate>> {
         Some(self.updates_rx.clone())
+    }
+
+    fn notifies_changes(&self) -> bool {
+        self.notifies_changes
     }
 
     fn notify_refresh(&self) {
@@ -475,6 +484,10 @@ fn client_builder(
         )
         .on_receive_notification(
             on_notification!(handle_complete_elicitation),
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_notification(
+            on_notification!(handle_sessions_changed),
             agent_client_protocol::on_receive_notification!(),
         )
 }
@@ -683,10 +696,10 @@ impl AcpConnection {
             .list
             .is_some()
         {
-            let list = Rc::new(AcpSessionList::new(
-                connection.clone(),
-                agent_supports_delete,
-            ));
+            let mut list = AcpSessionList::new(connection.clone(), agent_supports_delete);
+            list.notifies_changes =
+                session_list_changes::advertises_sessions_changed(response.meta.as_ref());
+            let list = Rc::new(list);
             *client_session_list.borrow_mut() = Some(list.clone());
             Some(list)
         } else {
@@ -5719,6 +5732,7 @@ mod tests {
                         default_mode: None,
                         default_config_options: HashMap::default(),
                         favorite_config_option_values: HashMap::default(),
+                        auto_import_sessions: None,
                     }
                     .into(),
                 )])),
@@ -6358,6 +6372,7 @@ mod tests {
                             AgentConfigOptionValue::from("config-value"),
                         )]),
                         favorite_config_option_values: HashMap::default(),
+                        auto_import_sessions: None,
                     }
                     .into(),
                 )])),

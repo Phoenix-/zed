@@ -235,6 +235,7 @@ impl AgentServerStore {
                     env: Default::default(),
                     default_config_options: HashMap::default(),
                     favorite_config_option_values: HashMap::default(),
+                    auto_import_sessions: None,
                 }),
             );
         });
@@ -1551,6 +1552,10 @@ pub enum CustomAgentServerSettings {
         ///
         /// Default: {}
         favorite_config_option_values: HashMap<String, Vec<String>>,
+        /// Whether to keep this agent's sessions in sync with the threads sidebar.
+        ///
+        /// Default: false
+        auto_import_sessions: bool,
     },
     Registry {
         /// Additional environment variables to pass to the agent.
@@ -1575,6 +1580,10 @@ pub enum CustomAgentServerSettings {
         ///
         /// Default: {}
         favorite_config_option_values: HashMap<String, Vec<String>>,
+        /// Whether to keep this agent's sessions in sync with the threads sidebar.
+        ///
+        /// Default: false
+        auto_import_sessions: bool,
     },
 }
 
@@ -1606,6 +1615,19 @@ impl CustomAgentServerSettings {
         }
     }
 
+    pub fn auto_import_sessions(&self) -> bool {
+        match self {
+            CustomAgentServerSettings::Custom {
+                auto_import_sessions,
+                ..
+            }
+            | CustomAgentServerSettings::Registry {
+                auto_import_sessions,
+                ..
+            } => *auto_import_sessions,
+        }
+    }
+
     pub fn favorite_config_option_values(&self, config_id: &str) -> Option<&[String]> {
         match self {
             CustomAgentServerSettings::Custom {
@@ -1632,6 +1654,7 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
                 default_mode,
                 default_config_options,
                 favorite_config_option_values,
+                auto_import_sessions,
             } => CustomAgentServerSettings::Custom {
                 command: AgentServerCommand {
                     path: PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).as_ref()),
@@ -1641,17 +1664,20 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
                 default_mode,
                 default_config_options,
                 favorite_config_option_values,
+                auto_import_sessions: auto_import_sessions.unwrap_or(false),
             },
             settings::CustomAgentServerSettings::Registry {
                 env,
                 default_mode,
                 default_config_options,
                 favorite_config_option_values,
+                auto_import_sessions,
             } => CustomAgentServerSettings::Registry {
                 env,
                 default_mode,
                 default_config_options,
                 favorite_config_option_values,
+                auto_import_sessions: auto_import_sessions.unwrap_or(false),
             },
         }
     }
@@ -1802,6 +1828,7 @@ mod tests {
                                     default_mode: None,
                                     default_config_options: HashMap::default(),
                                     favorite_config_option_values: HashMap::default(),
+                                    auto_import_sessions: None,
                                 }
                                 .into(),
                             )

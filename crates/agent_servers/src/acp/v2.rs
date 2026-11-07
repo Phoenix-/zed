@@ -2425,6 +2425,7 @@ mod tests {
                         default_mode: Some("legacy-must-not-run".into()),
                         default_config_options: defaults,
                         favorite_config_option_values: HashMap::default(),
+                        auto_import_sessions: None,
                     }
                     .into(),
                 )])),
@@ -7493,6 +7494,7 @@ done
                         default_mode: None,
                         default_config_options: HashMap::default(),
                         favorite_config_option_values: HashMap::default(),
+                        auto_import_sessions: None,
                     }
                     .into(),
                 )])),
