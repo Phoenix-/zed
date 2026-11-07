@@ -4,7 +4,8 @@
 //! Sessions an agent creates outside of Zed show up as threads, without going
 //! through the manual import modal. The agent's session list is read when Zed
 //! connects to it, whenever the agent reports a change, and on a slow timer for
-//! agents that don't report changes.
+//! agents that don't report changes. Sessions that an agent reports as started by
+//! another session are linked to their parent, so the sidebar can nest them.
 
 use std::{
     path::PathBuf,
@@ -12,7 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use acp_thread::{AgentSessionInfo, AgentSessionList, AgentSessionListRequest, SessionListUpdate};
+use acp_thread::{
+    AgentSessionInfo, AgentSessionInfoUpdate, AgentSessionList, AgentSessionListRequest,
+    SessionListUpdate,
+};
 use agent::ThreadStore;
 use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Context as _, Result};
@@ -40,6 +44,7 @@ use crate::{
     Agent, ConversationView,
     agent_connection_store::{AgentConnectionEntry, AgentConnectionStore},
     thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore, WorktreePaths},
+    thread_parent_store::{ThreadParentStore, parent_session_id_from_meta},
 };
 
 /// How often to list the sessions of agents that don't report changes themselves.
@@ -513,12 +518,28 @@ impl SessionAutoImport {
         let open_thread_ids = self.open_thread_ids(cx);
         let live_sessions = self.live_sessions(agent_id, cx);
         let store = ThreadMetadataStore::global(cx);
+        // The listing is authoritative for the parents of the sessions it contains.
+        let parent_links = listing
+            .sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.session_id.clone(),
+                    parent_session_id_from_meta(session.meta.as_ref()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let threads = agent_threads(store.read(cx), agent_id);
+        let mut sessions_with_threads = threads
+            .keys()
+            .map(|session_id| (*session_id).clone())
+            .collect::<HashSet<_>>();
         let no_known_sessions = HashMap::default();
         let plan = plan_sync(
             agent_id,
             remote_connection,
             listing,
-            &agent_threads(store.read(cx), agent_id),
+            &threads,
             self.known_sessions
                 .of(agent_id)
                 .unwrap_or(&no_known_sessions),
@@ -526,6 +547,25 @@ impl SessionAutoImport {
             &live_sessions,
             Utc::now(),
         );
+        sessions_with_threads.extend(
+            plan.save
+                .iter()
+                .filter_map(|thread| thread.session_id.clone()),
+        );
+        if let Some(parent_store) = ThreadParentStore::try_global(cx) {
+            parent_store.update(cx, |parent_store, cx| {
+                for (session_id, parent_session_id) in parent_links {
+                    if sessions_with_threads.contains(&session_id) {
+                        parent_store.set_parent_session_id(
+                            agent_id.clone(),
+                            session_id,
+                            parent_session_id,
+                            cx,
+                        );
+                    }
+                }
+            });
+        }
 
         for (session_id, imported) in plan.known {
             self.known_sessions.insert(agent_id, session_id, imported);
@@ -538,6 +578,32 @@ impl SessionAutoImport {
         }
         for thread_id in plan.delete {
             delete_thread(thread_id, cx);
+        }
+    }
+
+    fn apply_session_info(
+        &mut self,
+        agent_id: &AgentId,
+        session_id: acp::SessionId,
+        update: AgentSessionInfoUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        let mut info = AgentSessionInfo::new(session_id.clone());
+        info.apply_update(update);
+        // An update that doesn't name a parent leaves the link alone: agents
+        // report the link in full only in the session list.
+        let Some(parent_session_id) = parent_session_id_from_meta(info.meta.as_ref()) else {
+            return;
+        };
+        if let Some(parent_store) = ThreadParentStore::try_global(cx) {
+            parent_store.update(cx, |parent_store, cx| {
+                parent_store.set_parent_session_id(
+                    agent_id.clone(),
+                    session_id,
+                    Some(parent_session_id),
+                    cx,
+                );
+            });
         }
     }
 
@@ -738,17 +804,23 @@ async fn watch_session_list(
     poll_interval: Option<Duration>,
     cx: &mut AsyncApp,
 ) {
-    // Until both have loaded, every session would look unknown.
-    let Ok((metadata_loaded, known_sessions_loaded)) = this.read_with(cx, |this, cx| {
-        (
-            ThreadMetadataStore::global(cx).read(cx).reload_task(),
-            this.known_sessions.loaded.clone(),
-        )
-    }) else {
+    // Until these have loaded, every session would look unknown.
+    let Ok((metadata_loaded, known_sessions_loaded, parents_loaded)) =
+        this.read_with(cx, |this, cx| {
+            (
+                ThreadMetadataStore::global(cx).read(cx).reload_task(),
+                this.known_sessions.loaded.clone(),
+                ThreadParentStore::try_global(cx).map(|store| store.read(cx).reload_task()),
+            )
+        })
+    else {
         return;
     };
     metadata_loaded.await;
     known_sessions_loaded.await;
+    if let Some(parents_loaded) = parents_loaded {
+        parents_loaded.await;
+    }
 
     let mut needs_listing = true;
     loop {
@@ -796,7 +868,12 @@ async fn watch_session_list(
                     })
                     .ok();
                 }
-                SessionListUpdate::SessionInfo { .. } => {}
+                SessionListUpdate::SessionInfo { session_id, update } => {
+                    this.update(cx, |this, cx| {
+                        this.apply_session_info(&agent_id, session_id, update, cx)
+                    })
+                    .ok();
+                }
             }
         }
     }
@@ -1028,6 +1105,7 @@ mod tests {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
             ThreadMetadataStore::init_global(cx);
+            ThreadParentStore::init_global(cx);
             cx.new(SessionAutoImport::new)
         });
         // Threads saved before the stores have loaded would be lost on load, which
@@ -1297,6 +1375,122 @@ mod tests {
 
         assert_eq!(list.list_calls.get(), 2);
         assert!(thread("s2", cx).is_some());
+    }
+
+    fn with_parent(mut session: AgentSessionInfo, parent: &str) -> AgentSessionInfo {
+        session.meta = Some(acp::Meta::from_iter([(
+            crate::thread_parent_store::PARENT_SESSION_ID_META_KEY.into(),
+            parent.into(),
+        )]));
+        session
+    }
+
+    fn parent_of(agent: &str, session_id: &str, cx: &TestAppContext) -> Option<String> {
+        cx.read(|cx| {
+            ThreadParentStore::global(cx)
+                .read(cx)
+                .parent_session_id(&AgentId::new(agent), &acp::SessionId::new(session_id))
+                .map(|parent| parent.0.to_string())
+        })
+    }
+
+    fn parent(session_id: &str, cx: &TestAppContext) -> Option<String> {
+        parent_of("gorynych", session_id, cx)
+    }
+
+    #[gpui::test]
+    async fn test_listing_links_children_to_their_parents(cx: &mut TestAppContext) {
+        let auto_import = init_test(cx);
+        let list = FakeSessionList::new(
+            true,
+            vec![
+                session("coordinator", "Coordinator", "/project", 1),
+                with_parent(session("coder", "Coder", "/project", 2), "coordinator"),
+            ],
+        );
+        watch(&auto_import, &list, cx);
+
+        assert!(thread("coder", cx).is_some_and(|thread| !thread.archived));
+        assert_eq!(parent("coder", cx).as_deref(), Some("coordinator"));
+        assert_eq!(parent("coordinator", cx), None);
+
+        // The listing is authoritative: a session that lost its parent is unlinked.
+        *list.sessions.borrow_mut() = vec![
+            session("coordinator", "Coordinator", "/project", 1),
+            session("coder", "Coder", "/project", 2),
+        ];
+        list.refresh(cx);
+        assert_eq!(parent("coder", cx), None);
+    }
+
+    #[gpui::test]
+    async fn test_parent_links_belong_to_their_agent_and_go_with_the_thread(
+        cx: &mut TestAppContext,
+    ) {
+        let auto_import = init_test(cx);
+        // A Kimi child of a Claude coordinator names the Claude session.
+        let claude = FakeSessionList::new(
+            true,
+            vec![session("coordinator", "Coordinator", "/project", 1)],
+        );
+        let kimi = FakeSessionList::new(
+            true,
+            vec![
+                with_parent(session("coder", "Coder", "/project", 2), "coordinator"),
+                with_parent(session("deleted", "Deleted", "/project", 3), "coordinator"),
+            ],
+        );
+        watch_as("claude", &auto_import, &claude, cx);
+        watch_as("kimi", &auto_import, &kimi, cx);
+        assert_eq!(
+            parent_of("kimi", "coder", cx).as_deref(),
+            Some("coordinator")
+        );
+        assert_eq!(parent_of("claude", "coder", cx), None);
+
+        // A thread deleted in Zed takes its link along, and the link doesn't come back.
+        let deleted = thread_of("kimi", "deleted", cx).expect("imported");
+        update_store(cx, |store, cx| store.delete(deleted.thread_id, cx));
+        assert_eq!(parent_of("kimi", "deleted", cx), None);
+        kimi.refresh(cx);
+        assert_eq!(parent_of("kimi", "deleted", cx), None);
+
+        kimi.send(SessionListUpdate::SessionRemoved {
+            session_id: acp::SessionId::new("coder"),
+        });
+        cx.run_until_parked();
+        assert_eq!(parent_of("kimi", "coder", cx), None);
+    }
+
+    #[gpui::test]
+    async fn test_session_info_updates_link_children(cx: &mut TestAppContext) {
+        let auto_import = init_test(cx);
+        let list = FakeSessionList::new(true, vec![session("coder", "Coder", "/project", 2)]);
+        watch(&auto_import, &list, cx);
+
+        let update: agent_client_protocol::schema::v1::SessionInfoUpdate =
+            serde_json::from_value(serde_json::json!({
+                "title": "Coder",
+                "_meta": {"gorynych/parentSessionId": "coordinator"}
+            }))
+            .expect("session info update");
+        list.send(SessionListUpdate::SessionInfo {
+            session_id: acp::SessionId::new("coder"),
+            update: update.into(),
+        });
+        cx.run_until_parked();
+        assert_eq!(parent("coder", cx).as_deref(), Some("coordinator"));
+
+        // An update without the key keeps the link.
+        let update: agent_client_protocol::schema::v1::SessionInfoUpdate =
+            serde_json::from_value(serde_json::json!({"title": "Renamed"}))
+                .expect("session info update");
+        list.send(SessionListUpdate::SessionInfo {
+            session_id: acp::SessionId::new("coder"),
+            update: update.into(),
+        });
+        cx.run_until_parked();
+        assert_eq!(parent("coder", cx).as_deref(), Some("coordinator"));
     }
 
     #[gpui::test]

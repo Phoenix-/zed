@@ -33,6 +33,7 @@ pub mod terminal_thread_metadata_store;
 pub mod test_support;
 mod thread_import;
 pub mod thread_metadata_store;
+pub mod thread_parent_store;
 pub mod thread_worktree_archive;
 
 pub mod threads_archive_view;
@@ -713,6 +714,7 @@ pub fn init(
     agent_panel::init(cx);
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
+    thread_parent_store::init(cx);
     session_auto_import::init(cx);
     terminal_thread_metadata_store::init(cx);
 

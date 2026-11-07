@@ -1,4 +1,5 @@
 mod thread_switcher;
+mod thread_tree;
 
 use acp_thread::ThreadStatus;
 use action_log::DiffStats;
@@ -11,6 +12,7 @@ use agent_ui::terminal_thread_metadata_store::{
 use agent_ui::thread_metadata_store::{
     ThreadMetadata, ThreadMetadataStore, WorktreePaths, worktree_info_from_thread_paths,
 };
+use agent_ui::thread_parent_store::ThreadParentStore;
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
     fuzzy_match_positions,
@@ -507,6 +509,7 @@ struct SidebarContents {
     notified_terminals: HashSet<TerminalId>,
     project_header_indices: Vec<usize>,
     has_open_projects: bool,
+    thread_tree: HashMap<ThreadId, thread_tree::ThreadTreeRow>,
 }
 
 /// Identity-and-layout key for a [`ListEntry`] used to preserve measured list items
@@ -816,6 +819,8 @@ pub struct Sidebar {
     /// that when a draft that was empty gains content again, we refresh
     /// its interaction time.
     draft_kinds: HashMap<ThreadId, DraftKind>,
+    /// Threads whose child threads are hidden.
+    collapsed_thread_trees: HashSet<ThreadId>,
     view: SidebarView,
     restoring_tasks: HashMap<agent_ui::ThreadId, Task<()>>,
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
@@ -922,6 +927,13 @@ impl Sidebar {
         )
         .detach();
 
+        if let Some(thread_parent_store) = ThreadParentStore::try_global(cx) {
+            cx.observe(&thread_parent_store, |this, _store, cx| {
+                this.schedule_update_entries(false, cx);
+            })
+            .detach();
+        }
+
         let channels_with_threads = channels_with_threads(cx);
         cx.spawn(async move |this, cx| {
             let channels = channels_with_threads.await;
@@ -967,6 +979,7 @@ impl Sidebar {
             pending_thread_activation: None,
             live_thread_statuses: HashMap::new(),
             draft_kinds: HashMap::new(),
+            collapsed_thread_trees: HashSet::new(),
             view: SidebarView::default(),
             restoring_tasks: HashMap::new(),
             recent_projects_popover_handle: PopoverMenuHandle::default(),
@@ -1427,6 +1440,7 @@ impl Sidebar {
         let mut project_header_indices: Vec<usize> = Vec::new();
         let mut seen_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
         let mut seen_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        let mut thread_tree = HashMap::new();
 
         let has_open_projects = workspaces
             .iter()
@@ -1952,12 +1966,22 @@ impl Sidebar {
                     has_threads,
                 });
 
+                let group_start = entries.len();
                 Self::push_entries_by_display_time(
                     &mut entries,
                     matched_terminals,
                     matched_threads,
                     &mut current_session_ids,
                     &mut current_thread_ids,
+                );
+                // Matches stay visible even under a collapsed parent.
+                thread_tree::nest_group_rows(
+                    &mut entries,
+                    group_start,
+                    &HashSet::new(),
+                    None,
+                    &mut thread_tree,
+                    cx,
                 );
             } else {
                 let has_terminal_notifications = terminals
@@ -2002,12 +2026,21 @@ impl Sidebar {
                     continue;
                 }
 
+                let group_start = entries.len();
                 Self::push_entries_by_display_time(
                     &mut entries,
                     terminals,
                     threads,
                     &mut current_session_ids,
                     &mut current_thread_ids,
+                );
+                thread_tree::nest_group_rows(
+                    &mut entries,
+                    group_start,
+                    &self.collapsed_thread_trees,
+                    thread_tree::active_thread_id(self.active_entry.as_ref()),
+                    &mut thread_tree,
+                    cx,
                 );
             }
         }
@@ -2027,6 +2060,7 @@ impl Sidebar {
             notified_terminals,
             project_header_indices,
             has_open_projects,
+            thread_tree,
         };
     }
 
@@ -2273,7 +2307,10 @@ impl Sidebar {
                     cx,
                 )
             }
-            ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
+            ListEntry::Thread(thread) => {
+                let row = self.render_thread(ix, thread, is_active, is_selected, cx);
+                self.render_thread_tree_row(ix, thread.metadata.thread_id, row, cx)
+            }
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
@@ -4377,6 +4414,9 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let Some(ix) = self.selection else { return };
+        if self.expand_selected_thread_tree(ix, cx) {
+            return;
+        }
 
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => {
@@ -4401,6 +4441,9 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let Some(ix) = self.selection else { return };
+        if self.collapse_selected_thread_tree(ix, cx) {
+            return;
+        }
 
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => {
@@ -6356,6 +6399,10 @@ impl Sidebar {
                 this.custom_icon_from_external_svg(svg)
             })
             .worktrees(worktrees)
+            .when_some(
+                self.thread_parent_hint(&thread.metadata.thread_id),
+                |this, hint| this.project_name(hint),
+            )
             .timestamp(timestamp)
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)

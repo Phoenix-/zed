@@ -676,6 +676,16 @@ fn visible_entries_as_strings(
                     ListEntry::Thread(thread) => {
                         let title = thread.metadata.display_title();
                         let worktree = format_linked_worktree_chips(&thread.worktrees);
+                        let tree = sidebar.contents.thread_tree.get(&thread.metadata.thread_id);
+                        let indent = "  ".repeat(tree.map_or(0, |tree| tree.depth));
+                        let disclosure = match tree {
+                            Some(tree) if tree.child_count > 0 && tree.collapsed => "> ",
+                            Some(tree) if tree.child_count > 0 => "v ",
+                            _ => "",
+                        };
+                        let hint = tree
+                            .and_then(|tree| tree.parent_hint.as_ref())
+                            .map_or(String::new(), |hint| format!(" ({hint})"));
 
                         {
                             let live = if thread.is_live { " *" } else { "" };
@@ -693,7 +703,9 @@ fn visible_entries_as_strings(
                             } else {
                                 ""
                             };
-                            format!("  {title}{worktree}{live}{status_str}{notified}{selected}")
+                            format!(
+                                "  {indent}{disclosure}{title}{worktree}{live}{status_str}{notified}{hint}{selected}"
+                            )
                         }
                     }
                     ListEntry::Terminal(terminal) => {
@@ -16025,4 +16037,229 @@ fn sidebar_painted_background_at(position: Point<Pixels>, cx: &mut VisualTestCon
             .expect("solid background at pointer");
         u32::from(Rgba::from(color))
     })
+}
+
+fn set_thread_parent(child: &str, parent: &str, cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        agent_ui::thread_parent_store::ThreadParentStore::global(cx).update(cx, |store, cx| {
+            store.set_parent_session_id(
+                agent::ZED_AGENT_ID.clone(),
+                acp::SessionId::new(child),
+                Some(acp::SessionId::new(parent)),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+}
+
+fn thread_id_for_session(session_id: &str, cx: &mut TestAppContext) -> ThreadId {
+    cx.update(|cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(&acp::SessionId::new(session_id))
+            .map(|thread| thread.thread_id)
+            .expect("thread for session")
+    })
+}
+
+fn save_minute_thread(
+    session_id: &str,
+    title: &str,
+    minute: u32,
+    project: &Entity<project::Project>,
+    cx: &mut TestAppContext,
+) {
+    save_thread_metadata(
+        acp::SessionId::new(session_id),
+        Some(title.to_string().into()),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 11, 7, 10, minute, 0).unwrap(),
+        None,
+        None,
+        project,
+        cx,
+    );
+}
+
+#[gpui::test]
+async fn test_child_threads_nest_under_their_parents(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    cx.update(agent_ui::thread_parent_store::ThreadParentStore::init_global);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_minute_thread("coordinator", "Coordinator", 1, &project, cx);
+    save_minute_thread("solo", "Solo", 2, &project, cx);
+    save_minute_thread("coder-1", "Coder 1", 3, &project, cx);
+    save_minute_thread("reviewer", "Reviewer", 4, &project, cx);
+    save_minute_thread("coder-2", "Coder 2", 5, &project, cx);
+    save_minute_thread("orphan", "Orphan", 6, &project, cx);
+    set_thread_parent("coder-1", "coordinator", cx);
+    set_thread_parent("coder-2", "coordinator", cx);
+    set_thread_parent("reviewer", "coder-1", cx);
+    set_thread_parent("orphan", "missing", cx);
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            //
+            "v [my-project]",
+            "  Orphan (from an unknown thread)",
+            "  v Coordinator",
+            "    Coder 2",
+            "    v Coder 1",
+            "      Reviewer",
+            "  Solo",
+        ]
+    );
+
+    let coordinator = thread_id_for_session("coordinator", cx);
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_thread_tree(coordinator, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            //
+            "v [my-project]",
+            "  Orphan (from an unknown thread)",
+            "  > Coordinator",
+            "  Solo",
+        ]
+    );
+
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.toggle_thread_tree(coordinator, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(visible_entries_as_strings(&sidebar, cx).len(), 7);
+}
+
+#[gpui::test]
+async fn test_keyboard_navigates_thread_trees(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    cx.update(agent_ui::thread_parent_store::ThreadParentStore::init_global);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_minute_thread("coordinator", "Coordinator", 1, &project, cx);
+    save_minute_thread("coder", "Coder", 2, &project, cx);
+    set_thread_parent("coder", "coordinator", cx);
+    focus_sidebar(&sidebar, cx);
+    sidebar.update_in(cx, |sidebar, _window, _cx| sidebar.selection = Some(2));
+
+    // From a child, Left moves to its parent, then collapses it.
+    cx.dispatch_action(SelectParent);
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  v Coordinator  <== selected",
+            "    Coder"
+        ]
+    );
+    cx.dispatch_action(SelectParent);
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  > Coordinator  <== selected"]
+    );
+
+    // Right expands it, then moves to its first child.
+    cx.dispatch_action(SelectChild);
+    cx.run_until_parked();
+    cx.dispatch_action(SelectChild);
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  v Coordinator",
+            "    Coder  <== selected"
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_the_active_thread_stays_visible_under_a_collapsed_parent(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    cx.update(agent_ui::thread_parent_store::ThreadParentStore::init_global);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_minute_thread("coordinator", "Coordinator", 1, &project, cx);
+    save_minute_thread("coder", "Coder", 2, &project, cx);
+    save_minute_thread("reviewer", "Reviewer", 3, &project, cx);
+    set_thread_parent("coder", "coordinator", cx);
+    set_thread_parent("reviewer", "coordinator", cx);
+
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let coder = thread_id_for_session("coder", cx);
+    let coordinator = thread_id_for_session("coordinator", cx);
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.active_entry = Some(ActiveEntry::Thread {
+            thread_id: coder,
+            session_id: Some(acp::SessionId::new("coder")),
+            workspace,
+        });
+        sidebar.toggle_thread_tree(coordinator, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  > Coordinator", "    Coder"]
+    );
+}
+
+#[gpui::test]
+async fn test_child_threads_in_another_project_show_their_parent(cx: &mut TestAppContext) {
+    let (fs, project_a) = init_multi_project_test(&["/project-a", "/project-b"], cx).await;
+    cx.update(agent_ui::thread_parent_store::ThreadParentStore::init_global);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let workspace_b = add_test_project("/project-b", &fs, &multi_workspace, cx).await;
+    let project_b = workspace_b.read_with(cx, |workspace, _| workspace.project().clone());
+
+    save_minute_thread("coordinator", "Coordinator", 1, &project_a, cx);
+    save_minute_thread("coder", "Coder", 2, &project_a, cx);
+    save_minute_thread("remote-coder", "Coder in project B", 3, &project_b, cx);
+    set_thread_parent("coder", "coordinator", cx);
+    set_thread_parent("remote-coder", "coordinator", cx);
+
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    assert!(
+        entries.contains(&"  Coder in project B (from Coordinator)".to_string()),
+        "{entries:#?}"
+    );
+    assert!(
+        entries.contains(&"  v Coordinator".to_string())
+            && entries.contains(&"    Coder".to_string()),
+        "{entries:#?}"
+    );
+}
+
+#[gpui::test]
+async fn test_groups_without_child_threads_render_flat(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    cx.update(agent_ui::thread_parent_store::ThreadParentStore::init_global);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_minute_thread("first", "First", 1, &project, cx);
+    save_minute_thread("second", "Second", 2, &project, cx);
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Second", "  First"]
+    );
+    assert!(sidebar.read_with(cx, |sidebar, _| sidebar.contents.thread_tree.is_empty()));
 }
