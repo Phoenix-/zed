@@ -60,7 +60,7 @@ jobs:
       - name: Build
         run: |
           $ErrorActionPreference = 'Continue'
-          cargo build --profile release-fast -p zed
+          cargo build --profile release-fast -p zed -p cli
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Package
@@ -69,11 +69,14 @@ jobs:
           $out = Join-Path $env:CARGO_TARGET_DIR 'release-fast'
           $stage = Join-Path $env:RUNNER_TEMP 'zed-gorynych'
           if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
-          New-Item -ItemType Directory -Path (Join-Path $stage 'x64') | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $stage 'x64'), (Join-Path $stage 'bin') | Out-Null
           # zed.exe runs its terminals through the conpty.dll that its build
           # downloads next to it; conpty.dll starts OpenConsole.exe.
           Copy-Item (Join-Path $out 'zed.exe'), (Join-Path $out 'conpty.dll'), (Join-Path $out 'OpenConsole.exe') $stage
           Copy-Item (Join-Path $out 'OpenConsole.exe') (Join-Path $stage 'x64')
+          # The CLI, where installed builds keep it: zed.exe uses it to answer
+          # git and ssh password prompts, and it's the `zed` command.
+          Copy-Item (Join-Path $out 'cli.exe') (Join-Path $stage 'bin\zed.exe')
           $zip = Join-Path $env:RUNNER_TEMP $env:ASSET
           if (Test-Path $zip) { Remove-Item -Force $zip }
           $ErrorActionPreference = 'Continue'
