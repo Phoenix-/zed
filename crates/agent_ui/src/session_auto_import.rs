@@ -6,6 +6,11 @@
 //! connects to it, whenever the agent reports a change, and on a slow timer for
 //! agents that don't report changes. Sessions that an agent reports as started by
 //! another session are linked to their parent, so the sidebar can nest them.
+//!
+//! Agents that keep an archive of their own (the Gorynych extension advertised by
+//! `gorynych/archive`) share it with Zed's: a session the agent archives or restores
+//! is archived or restored here, and the user archiving or restoring its thread is
+//! reported to the agent.
 
 use std::{
     path::PathBuf,
@@ -58,6 +63,17 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_CONNECT_ATTEMPTS: u32 = 3;
 const STABLE_CONNECTION: Duration = Duration::from_secs(10 * 60);
 
+/// Key of a session's archived flag in the `_meta` of its info, for agents whose
+/// session list supports the archive. A listed session without it isn't archived;
+/// a session info update carries it only when the flag changes.
+const ARCHIVED_META_KEY: &str = "gorynych/archived";
+/// Key in the `_meta` of a `session/list` request that includes archived sessions.
+const INCLUDE_ARCHIVED_META_KEY: &str = "gorynych/includeArchived";
+
+fn archived_from_meta(meta: Option<&acp::Meta>) -> Option<bool> {
+    meta?.get(ARCHIVED_META_KEY)?.as_bool()
+}
+
 pub fn init(cx: &mut App) {
     let auto_import = cx.new(SessionAutoImport::new);
     cx.set_global(GlobalSessionAutoImport {
@@ -83,6 +99,10 @@ pub struct SessionAutoImport {
     stores: HashMap<EntityId, (WeakEntity<AgentConnectionStore>, [Subscription; 2])>,
     conversation_views: HashMap<EntityId, WeakEntity<ConversationView>>,
     known_sessions: KnownSessions,
+    /// The archived state last requested from an agent for a session, until the
+    /// agent reports the session's flag again.
+    archive_requests: HashMap<(AgentId, acp::SessionId), bool>,
+    _metadata_subscription: Option<Subscription>,
 }
 
 struct SessionListWatcher {
@@ -121,25 +141,34 @@ impl ConnectAttempts {
     }
 }
 
-/// The sessions of each agent that had a thread in a listing, with whether this
-/// importer created that thread.
+/// The sessions of each agent that had a thread in a listing.
 ///
 /// They are persisted, so that a session whose thread was deleted in Zed is not
-/// imported again, and so that only threads created here are dropped when their
-/// sessions disappear from a listing.
+/// imported again, so that only threads created here are dropped when their
+/// sessions disappear from a listing, and so that archiving a thread while its
+/// agent is away still reaches the agent later.
 struct KnownSessions {
-    sessions: HashMap<AgentId, HashMap<acp::SessionId, bool>>,
+    sessions: HashMap<AgentId, HashMap<acp::SessionId, KnownSession>>,
     loaded: Shared<Task<()>>,
     /// Writes go through one queue so that they apply in the order they are made.
     pending_writes: async_channel::Sender<KnownSessionWrite>,
     _write_task: Task<()>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KnownSession {
+    /// Whether this importer created the session's thread.
+    imported: bool,
+    /// The session's archived flag as the agent last reported it, for agents that
+    /// keep an archive.
+    archived: Option<bool>,
+}
+
 enum KnownSessionWrite {
     Save {
         agent_id: String,
         session_id: String,
-        imported: bool,
+        session: KnownSession,
     },
     Delete {
         agent_id: String,
@@ -148,22 +177,26 @@ enum KnownSessionWrite {
 }
 
 impl KnownSessions {
-    fn of(&self, agent_id: &AgentId) -> Option<&HashMap<acp::SessionId, bool>> {
+    fn of(&self, agent_id: &AgentId) -> Option<&HashMap<acp::SessionId, KnownSession>> {
         self.sessions.get(agent_id)
     }
 
-    fn insert(&mut self, agent_id: &AgentId, session_id: acp::SessionId, imported: bool) {
+    fn get(&self, agent_id: &AgentId, session_id: &acp::SessionId) -> Option<KnownSession> {
+        self.of(agent_id)?.get(session_id).copied()
+    }
+
+    fn insert(&mut self, agent_id: &AgentId, session_id: acp::SessionId, session: KnownSession) {
         let previous = self
             .sessions
             .entry(agent_id.clone())
             .or_default()
-            .insert(session_id.clone(), imported);
-        if previous != Some(imported) {
+            .insert(session_id.clone(), session);
+        if previous != Some(session) {
             self.pending_writes
                 .try_send(KnownSessionWrite::Save {
                     agent_id: agent_id.to_string(),
                     session_id: session_id.0.to_string(),
-                    imported,
+                    session,
                 })
                 .log_err();
         }
@@ -242,6 +275,12 @@ impl SessionAutoImport {
         })
         .detach();
 
+        let metadata_subscription = ThreadMetadataStore::try_global(cx).map(|store| {
+            cx.observe(&store, |this, _store, cx| {
+                this.send_local_archive_changes(cx)
+            })
+        });
+
         let rows = cx.background_spawn({
             let db = db.clone();
             async move { db.list() }
@@ -256,14 +295,14 @@ impl SessionAutoImport {
                     return;
                 };
                 this.update(cx, |this, _| {
-                    for (agent_id, session_id, imported) in rows {
+                    for (agent_id, session_id, imported, archived) in rows {
                         // Sessions recorded while loading are newer than the stored ones.
                         this.known_sessions
                             .sessions
                             .entry(AgentId::new(agent_id))
                             .or_default()
                             .entry(acp::SessionId::new(session_id))
-                            .or_insert(imported);
+                            .or_insert(KnownSession { imported, archived });
                     }
                 })
                 .ok();
@@ -290,6 +329,8 @@ impl SessionAutoImport {
                 pending_writes,
                 _write_task: write_task,
             },
+            archive_requests: HashMap::default(),
+            _metadata_subscription: metadata_subscription,
         }
     }
 
@@ -512,9 +553,23 @@ impl SessionAutoImport {
         &mut self,
         agent_id: &AgentId,
         remote_connection: Option<&RemoteConnectionOptions>,
+        session_list: &Rc<dyn AgentSessionList>,
         listing: SessionListing,
         cx: &mut Context<Self>,
     ) {
+        if listing.archive {
+            // The listing reports the flags of these sessions, so earlier requests
+            // either took effect or are made again.
+            let listed = listing
+                .sessions
+                .iter()
+                .map(|session| &session.session_id)
+                .collect::<HashSet<_>>();
+            self.archive_requests
+                .retain(|(requested_agent, session_id), _| {
+                    requested_agent != agent_id || !listed.contains(session_id)
+                });
+        }
         let open_thread_ids = self.open_thread_ids(cx);
         let live_sessions = self.live_sessions(agent_id, cx);
         let store = ThreadMetadataStore::global(cx);
@@ -567,14 +622,22 @@ impl SessionAutoImport {
             });
         }
 
-        for (session_id, imported) in plan.known {
-            self.known_sessions.insert(agent_id, session_id, imported);
+        // Recorded first, so that the archive changes below don't look like the
+        // user's own.
+        for (session_id, session) in plan.known {
+            self.known_sessions.insert(agent_id, session_id, session);
         }
         for session_id in &plan.forgotten {
             self.known_sessions.remove(agent_id, session_id);
         }
         if !plan.save.is_empty() {
             store.update(cx, |store, cx| store.save_all(plan.save, cx));
+        }
+        for (thread_id, archived) in plan.archive {
+            set_thread_archived(thread_id, archived, cx);
+        }
+        for (session_id, archived) in plan.send {
+            self.request_archive(session_list, agent_id, session_id, archived, cx);
         }
         for thread_id in plan.delete {
             delete_thread(thread_id, cx);
@@ -584,12 +647,19 @@ impl SessionAutoImport {
     fn apply_session_info(
         &mut self,
         agent_id: &AgentId,
+        session_list: &Rc<dyn AgentSessionList>,
         session_id: acp::SessionId,
         update: AgentSessionInfoUpdate,
         cx: &mut Context<Self>,
     ) {
         let mut info = AgentSessionInfo::new(session_id.clone());
         info.apply_update(update);
+        if session_list.supports_archive()
+            && let Some(archived) = archived_from_meta(info.meta.as_ref())
+        {
+            self.apply_reported_archive(agent_id, session_list, &session_id, archived, cx);
+        }
+
         // An update that doesn't name a parent leaves the link alone: agents
         // report the link in full only in the session list.
         let Some(parent_session_id) = parent_session_id_from_meta(info.meta.as_ref()) else {
@@ -605,6 +675,124 @@ impl SessionAutoImport {
                 );
             });
         }
+    }
+
+    /// Reconciles a thread with the archived flag its agent reported for the
+    /// session outside a listing.
+    fn apply_reported_archive(
+        &mut self,
+        agent_id: &AgentId,
+        session_list: &Rc<dyn AgentSessionList>,
+        session_id: &acp::SessionId,
+        reported: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.archive_requests
+            .remove(&(agent_id.clone(), session_id.clone()));
+        let Some((thread_id, local)) =
+            agent_threads(ThreadMetadataStore::global(cx).read(cx), agent_id)
+                .get(session_id)
+                .filter(|thread| syncs_archive(thread))
+                .map(|thread| (thread.thread_id, thread.archived))
+        else {
+            return;
+        };
+        let mut known = self
+            .known_sessions
+            .get(agent_id, session_id)
+            .unwrap_or(KnownSession {
+                imported: false,
+                archived: None,
+            });
+        let sync = reconcile_archive(local, known.archived, reported);
+        known.archived = Some(reported);
+        self.known_sessions
+            .insert(agent_id, session_id.clone(), known);
+        match sync {
+            ArchiveSync::InSync => {}
+            ArchiveSync::Apply(archived) => set_thread_archived(thread_id, archived, cx),
+            ArchiveSync::Send(archived) => {
+                self.request_archive(session_list, agent_id, session_id.clone(), archived, cx)
+            }
+        }
+    }
+
+    /// Tells agents about threads the user archived or restored since the agent
+    /// last reported their sessions' flags.
+    fn send_local_archive_changes(&mut self, cx: &mut Context<Self>) {
+        let session_lists = self
+            .watchers
+            .iter()
+            .filter_map(|watcher| {
+                let session_list = watcher.session_list.upgrade()?;
+                session_list.supports_archive().then(|| {
+                    (
+                        watcher.agent_id.clone(),
+                        watcher.remote_connection.clone(),
+                        session_list,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if session_lists.is_empty() {
+            return;
+        }
+
+        let mut requests = Vec::new();
+        let store = ThreadMetadataStore::global(cx).read(cx);
+        for (agent_id, remote_connection, session_list) in &session_lists {
+            for (session_id, thread) in agent_threads(store, agent_id) {
+                if !syncs_archive(thread)
+                    || !same_remote_connection_identity(
+                        thread.remote_connection.as_ref(),
+                        remote_connection.as_ref(),
+                    )
+                {
+                    continue;
+                }
+                let Some(reported) = self
+                    .known_sessions
+                    .get(agent_id, session_id)
+                    .and_then(|known| known.archived)
+                else {
+                    continue;
+                };
+                let key = (agent_id.clone(), session_id.clone());
+                if thread.archived == reported {
+                    self.archive_requests.remove(&key);
+                } else if self.archive_requests.get(&key) != Some(&thread.archived) {
+                    requests.push((session_list.clone(), key, thread.archived));
+                }
+            }
+        }
+        for (session_list, (agent_id, session_id), archived) in requests {
+            self.request_archive(&session_list, &agent_id, session_id, archived, cx);
+        }
+    }
+
+    /// Asks the agent to archive or restore a session, unless that is what was
+    /// last asked. A failure is only logged: the thread keeps its state in Zed.
+    fn request_archive(
+        &mut self,
+        session_list: &Rc<dyn AgentSessionList>,
+        agent_id: &AgentId,
+        session_id: acp::SessionId,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (agent_id.clone(), session_id.clone());
+        if self.archive_requests.insert(key, archived) == Some(archived) {
+            return;
+        }
+        let request = session_list.set_session_archived(&session_id, archived, cx);
+        let agent_id = agent_id.clone();
+        cx.spawn(async move |_, _| {
+            if let Err(error) = request.await {
+                let action = if archived { "archive" } else { "restore" };
+                log::warn!("Failed to {action} session {session_id} of {agent_id}: {error:#}");
+            }
+        })
+        .detach();
     }
 
     /// The agent no longer has the session, so its thread could not be loaded
@@ -624,6 +812,48 @@ impl SessionAutoImport {
         if let Some(thread_id) = thread_id {
             delete_thread(thread_id, cx);
         }
+    }
+}
+
+/// Archives or restores a thread as the archive view does, leaving its
+/// worktrees alone.
+fn set_thread_archived(thread_id: ThreadId, archived: bool, cx: &mut App) {
+    ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+        if archived {
+            store.archive(thread_id, None, cx);
+        } else {
+            store.unarchive(thread_id, cx);
+        }
+    });
+}
+
+/// Threads without a folder are archived by Zed so that they don't get lost,
+/// not by the user, so their state isn't shared with the agent.
+fn syncs_archive(thread: &ThreadMetadata) -> bool {
+    !thread.worktree_paths.is_empty()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArchiveSync {
+    InSync,
+    /// The agent changed the flag: the thread follows it.
+    Apply(bool),
+    /// The user changed the thread: the agent is told.
+    Send(bool),
+}
+
+/// Reconciles a thread's archived state with the flag the agent reports for its
+/// session. A flag that changed since the agent last reported it wins; otherwise
+/// the thread was archived or restored in Zed. Without an earlier report, an
+/// archive on either side wins.
+fn reconcile_archive(local: bool, last_reported: Option<bool>, reported: bool) -> ArchiveSync {
+    if local == reported {
+        return ArchiveSync::InSync;
+    }
+    match last_reported {
+        Some(last_reported) if last_reported == reported => ArchiveSync::Send(local),
+        None if local => ArchiveSync::Send(local),
+        _ => ArchiveSync::Apply(reported),
     }
 }
 
@@ -692,15 +922,22 @@ struct SessionListing {
     /// Whether every page was read, so that a session missing from the listing is
     /// gone from the agent.
     complete: bool,
+    /// Whether the agent keeps an archive, so that the listing includes archived
+    /// sessions and flags them.
+    archive: bool,
 }
 
 #[derive(Default)]
 struct SyncPlan {
     save: Vec<ThreadMetadata>,
     delete: Vec<ThreadId>,
-    /// Sessions that had a thread in this listing, with whether it is created now.
-    known: Vec<(acp::SessionId, bool)>,
+    /// Sessions that had a thread in this listing and whose record changes.
+    known: Vec<(acp::SessionId, KnownSession)>,
     forgotten: Vec<acp::SessionId>,
+    /// Threads to archive or restore, as their agent did.
+    archive: Vec<(ThreadId, bool)>,
+    /// Sessions to archive or restore in the agent, as the user did.
+    send: Vec<(acp::SessionId, bool)>,
 }
 
 /// Plans how a listing changes `agent_id`'s threads.
@@ -710,13 +947,15 @@ struct SyncPlan {
 /// is skipped, and so is a session that a live thread holds before its metadata
 /// names it. When the listing is complete, a session missing from it is
 /// forgotten, and its thread is deleted if this importer created it, unless the
-/// thread is archived or open.
+/// thread is archived or open. For agents that keep an archive, new archived
+/// sessions are imported into the archive, and known threads are reconciled
+/// with their sessions' flags.
 fn plan_sync(
     agent_id: &AgentId,
     remote_connection: Option<&RemoteConnectionOptions>,
     listing: SessionListing,
     threads: &HashMap<&acp::SessionId, &ThreadMetadata>,
-    known_sessions: &HashMap<acp::SessionId, bool>,
+    known_sessions: &HashMap<acp::SessionId, KnownSession>,
     open_thread_ids: &HashSet<ThreadId>,
     live_sessions: &HashSet<acp::SessionId>,
     now: DateTime<Utc>,
@@ -727,10 +966,32 @@ fn plan_sync(
         if !listed.insert(session.session_id.clone()) {
             continue;
         }
+        let reported_archived = listing
+            .archive
+            .then(|| archived_from_meta(session.meta.as_ref()).unwrap_or(false));
 
         if let Some(existing) = threads.get(&session.session_id) {
-            if !known_sessions.contains_key(&session.session_id) {
-                plan.known.push((session.session_id.clone(), false));
+            let known = known_sessions.get(&session.session_id).copied();
+            let mut record = known.unwrap_or(KnownSession {
+                imported: false,
+                archived: None,
+            });
+            if let Some(reported) = reported_archived
+                && syncs_archive(existing)
+            {
+                match reconcile_archive(existing.archived, record.archived, reported) {
+                    ArchiveSync::InSync => {}
+                    ArchiveSync::Apply(archived) => {
+                        plan.archive.push((existing.thread_id, archived))
+                    }
+                    ArchiveSync::Send(archived) => {
+                        plan.send.push((session.session_id.clone(), archived))
+                    }
+                }
+                record.archived = Some(reported);
+            }
+            if known != Some(record) {
+                plan.known.push((session.session_id.clone(), record));
             }
             let mut updated = (*existing).clone();
             if let Some(updated_at) = session.updated_at {
@@ -759,7 +1020,13 @@ fn plan_sync(
             None => normalize_local_paths(&work_dirs),
         };
         let worktree_paths = WorktreePaths::from_folder_paths(&work_dirs);
-        plan.known.push((session.session_id.clone(), true));
+        plan.known.push((
+            session.session_id.clone(),
+            KnownSession {
+                imported: true,
+                archived: reported_archived,
+            },
+        ));
         plan.save.push(ThreadMetadata {
             thread_id: ThreadId::new(),
             session_id: Some(session.session_id),
@@ -771,20 +1038,20 @@ fn plan_sync(
             interacted_at: None,
             // Like threads started in an empty window, threads without a folder
             // would never show in the sidebar, so they go to the archive.
-            archived: worktree_paths.is_empty(),
+            archived: worktree_paths.is_empty() || reported_archived == Some(true),
             worktree_paths,
             remote_connection: remote_connection.cloned(),
         });
     }
 
     if listing.complete {
-        for (session_id, imported) in known_sessions {
+        for (session_id, known) in known_sessions {
             if listed.contains(session_id) {
                 continue;
             }
             plan.forgotten.push(session_id.clone());
             if let Some(thread) = threads.get(session_id)
-                && *imported
+                && known.imported
                 && !thread.archived
                 && !open_thread_ids.contains(&thread.thread_id)
             {
@@ -829,10 +1096,16 @@ async fn watch_session_list(
             let Some(list) = session_list.upgrade() else {
                 break;
             };
-            match list_all_sessions(list, cx).await {
+            match list_all_sessions(list.clone(), cx).await {
                 Ok(listing) => {
                     let synced = this.update(cx, |this, cx| {
-                        this.sync_sessions(&agent_id, remote_connection.as_ref(), listing, cx)
+                        this.sync_sessions(
+                            &agent_id,
+                            remote_connection.as_ref(),
+                            &list,
+                            listing,
+                            cx,
+                        )
                     });
                     if synced.is_err() {
                         break;
@@ -869,8 +1142,11 @@ async fn watch_session_list(
                     .ok();
                 }
                 SessionListUpdate::SessionInfo { session_id, update } => {
+                    let Some(list) = session_list.upgrade() else {
+                        continue;
+                    };
                     this.update(cx, |this, cx| {
-                        this.apply_session_info(&agent_id, session_id, update, cx)
+                        this.apply_session_info(&agent_id, &list, session_id, update, cx)
                     })
                     .ok();
                 }
@@ -916,11 +1192,16 @@ async fn list_all_sessions(
     session_list: Rc<dyn AgentSessionList>,
     cx: &mut AsyncApp,
 ) -> Result<SessionListing> {
+    // Without archived sessions, a session archived elsewhere would look gone.
+    let archive = session_list.supports_archive();
+    let meta =
+        archive.then(|| acp::Meta::from_iter([(INCLUDE_ARCHIVED_META_KEY.into(), true.into())]));
     let mut sessions = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
         let request = AgentSessionListRequest {
             cursor: cursor.clone(),
+            meta: meta.clone(),
             ..Default::default()
         };
         let response = cx
@@ -932,6 +1213,7 @@ async fn list_all_sessions(
                 return Ok(SessionListing {
                     sessions,
                     complete: true,
+                    archive,
                 });
             }
             Some(next_cursor) if Some(&next_cursor) != cursor.as_ref() => {
@@ -942,6 +1224,7 @@ async fn list_all_sessions(
                 return Ok(SessionListing {
                     sessions,
                     complete: false,
+                    archive,
                 });
             }
         }
@@ -953,22 +1236,25 @@ struct SessionAutoImportDb(ThreadSafeConnection);
 impl Domain for SessionAutoImportDb {
     const NAME: &str = stringify!(SessionAutoImportDb);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS auto_import_known_sessions(
-            agent_id TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            imported INTEGER NOT NULL,
-            PRIMARY KEY (agent_id, session_id)
-        ) STRICT;
-    )];
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE IF NOT EXISTS auto_import_known_sessions(
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                imported INTEGER NOT NULL,
+                PRIMARY KEY (agent_id, session_id)
+            ) STRICT;
+        ),
+        sql!(ALTER TABLE auto_import_known_sessions ADD COLUMN archived INTEGER;),
+    ];
 }
 
 db::static_connection!(SessionAutoImportDb, []);
 
 impl SessionAutoImportDb {
-    fn list(&self) -> anyhow::Result<Vec<(String, String, bool)>> {
-        self.select::<(String, String, bool)>(
-            "SELECT agent_id, session_id, imported FROM auto_import_known_sessions",
+    fn list(&self) -> anyhow::Result<Vec<(String, String, bool, Option<bool>)>> {
+        self.select::<(String, String, bool, Option<bool>)>(
+            "SELECT agent_id, session_id, imported, archived FROM auto_import_known_sessions",
         )?()
     }
 
@@ -977,17 +1263,19 @@ impl SessionAutoImportDb {
             KnownSessionWrite::Save {
                 agent_id,
                 session_id,
-                imported,
+                session,
             } => {
                 let mut statement = Statement::prepare(
                     conn,
-                    "INSERT INTO auto_import_known_sessions(agent_id, session_id, imported) \
-                     VALUES (?1, ?2, ?3) \
-                     ON CONFLICT(agent_id, session_id) DO UPDATE SET imported = excluded.imported",
+                    "INSERT INTO auto_import_known_sessions(agent_id, session_id, imported, archived) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(agent_id, session_id) DO UPDATE SET \
+                     imported = excluded.imported, archived = excluded.archived",
                 )?;
                 let mut index = statement.bind(&agent_id, 1)?;
                 index = statement.bind(&session_id, index)?;
-                statement.bind(&imported, index)?;
+                index = statement.bind(&session.imported, index)?;
+                statement.bind(&session.archived, index)?;
                 statement.exec()
             }
             KnownSessionWrite::Delete {
@@ -1023,21 +1311,55 @@ mod tests {
     struct FakeSessionList {
         sessions: RefCell<Vec<AgentSessionInfo>>,
         notifies_changes: bool,
+        supports_archive: bool,
+        fail_archive_requests: Cell<bool>,
         list_calls: Cell<usize>,
+        listing_metas: RefCell<Vec<Option<acp::Meta>>>,
+        archive_requests: RefCell<Vec<(String, bool)>>,
         updates_tx: async_channel::Sender<SessionListUpdate>,
         updates_rx: async_channel::Receiver<SessionListUpdate>,
     }
 
     impl FakeSessionList {
         fn new(notifies_changes: bool, sessions: Vec<AgentSessionInfo>) -> Rc<Self> {
+            Self::build(notifies_changes, false, sessions)
+        }
+
+        /// An agent that keeps an archive and, like Gorynych, lists archived
+        /// sessions only on request.
+        fn with_archive(notifies_changes: bool, sessions: Vec<AgentSessionInfo>) -> Rc<Self> {
+            Self::build(notifies_changes, true, sessions)
+        }
+
+        fn build(
+            notifies_changes: bool,
+            supports_archive: bool,
+            sessions: Vec<AgentSessionInfo>,
+        ) -> Rc<Self> {
             let (updates_tx, updates_rx) = async_channel::unbounded();
             Rc::new(Self {
                 sessions: RefCell::new(sessions),
                 notifies_changes,
+                supports_archive,
+                fail_archive_requests: Cell::new(false),
                 list_calls: Cell::new(0),
+                listing_metas: RefCell::default(),
+                archive_requests: RefCell::default(),
                 updates_tx,
                 updates_rx,
             })
+        }
+
+        fn requests(&self) -> Vec<(String, bool)> {
+            self.archive_requests.borrow().clone()
+        }
+
+        fn set_archived(&self, session_id: &str, archived: bool) {
+            for session in self.sessions.borrow_mut().iter_mut() {
+                if session.session_id.0.as_ref() == session_id {
+                    set_archived_meta(session, archived);
+                }
+            }
         }
 
         fn send(&self, update: SessionListUpdate) {
@@ -1060,11 +1382,28 @@ mod tests {
             _cx: &mut App,
         ) -> Task<Result<AgentSessionListResponse>> {
             self.list_calls.set(self.list_calls.get() + 1);
+            let include_archived = request
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get(INCLUDE_ARCHIVED_META_KEY))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            self.listing_metas.borrow_mut().push(request.meta);
             let start = request
                 .cursor
                 .and_then(|cursor| cursor.parse::<usize>().ok())
                 .unwrap_or(0);
-            let sessions = self.sessions.borrow();
+            let sessions = self
+                .sessions
+                .borrow()
+                .iter()
+                .filter(|session| {
+                    !self.supports_archive
+                        || include_archived
+                        || archived_from_meta(session.meta.as_ref()) != Some(true)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
             let end = (start + PAGE_SIZE).min(sessions.len());
             let mut response = AgentSessionListResponse::new(sessions[start..end].to_vec());
             if end < sessions.len() {
@@ -1081,9 +1420,47 @@ mod tests {
             self.notifies_changes
         }
 
+        fn supports_archive(&self) -> bool {
+            self.supports_archive
+        }
+
+        fn set_session_archived(
+            &self,
+            session_id: &acp::SessionId,
+            archived: bool,
+            _cx: &mut App,
+        ) -> Task<Result<()>> {
+            self.archive_requests
+                .borrow_mut()
+                .push((session_id.0.to_string(), archived));
+            if self.fail_archive_requests.get() {
+                return Task::ready(Err(anyhow::anyhow!("the agent is unavailable")));
+            }
+            self.set_archived(&session_id.0, archived);
+            Task::ready(Ok(()))
+        }
+
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    fn set_archived_meta(session: &mut AgentSessionInfo, archived: bool) {
+        session
+            .meta
+            .get_or_insert_default()
+            .insert(ARCHIVED_META_KEY.into(), archived.into());
+    }
+
+    fn archived(mut session: AgentSessionInfo) -> AgentSessionInfo {
+        set_archived_meta(&mut session, true);
+        session
+    }
+
+    fn info_update(update: serde_json::Value) -> AgentSessionInfoUpdate {
+        serde_json::from_value::<agent_client_protocol::schema::v1::SessionInfoUpdate>(update)
+            .expect("session info update")
+            .into()
     }
 
     fn session(session_id: &str, title: &str, folder: &str, minute: u32) -> AgentSessionInfo {
@@ -1493,6 +1870,283 @@ mod tests {
         assert_eq!(parent("coder", cx).as_deref(), Some("coordinator"));
     }
 
+    fn is_archived(session_id: &str, cx: &TestAppContext) -> Option<bool> {
+        thread(session_id, cx).map(|thread| thread.archived)
+    }
+
+    fn save_thread(
+        session_id: &str,
+        folder: Option<&str>,
+        archived: bool,
+        cx: &mut TestAppContext,
+    ) -> ThreadId {
+        let thread_id = ThreadId::new();
+        let worktree_paths = folder.map_or_else(WorktreePaths::default, |folder| {
+            WorktreePaths::from_folder_paths(&PathList::new(&[Path::new(folder)]))
+        });
+        update_store(cx, |store, cx| {
+            store.save(
+                ThreadMetadata {
+                    thread_id,
+                    session_id: Some(acp::SessionId::new(session_id)),
+                    agent_id: AgentId::new("gorynych"),
+                    title: None,
+                    title_override: None,
+                    updated_at: timestamp(1),
+                    created_at: None,
+                    interacted_at: None,
+                    worktree_paths,
+                    remote_connection: None,
+                    archived,
+                },
+                cx,
+            )
+        });
+        thread_id
+    }
+
+    fn request(session_id: &str, archived: bool) -> (String, bool) {
+        (session_id.to_string(), archived)
+    }
+
+    #[gpui::test]
+    async fn test_threads_follow_the_sessions_their_agent_archives_and_restores(
+        cx: &mut TestAppContext,
+    ) {
+        let auto_import = init_test(cx);
+        let list = FakeSessionList::with_archive(
+            true,
+            vec![
+                session("active", "Active", "/project", 1),
+                archived(session("shelved", "Shelved", "/project", 2)),
+            ],
+        );
+        watch(&auto_import, &list, cx);
+
+        // Archived sessions are listed on request, and arrive in the archive.
+        let include_archived = serde_json::Value::Bool(true);
+        assert!(list.listing_metas.borrow().iter().all(|meta| {
+            meta.as_ref()
+                .and_then(|meta| meta.get(INCLUDE_ARCHIVED_META_KEY))
+                == Some(&include_archived)
+        }));
+        assert_eq!(is_archived("active", cx), Some(false));
+        assert_eq!(is_archived("shelved", cx), Some(true));
+
+        // A listing reports an archive.
+        list.set_archived("active", true);
+        list.refresh(cx);
+        assert_eq!(is_archived("active", cx), Some(true));
+
+        // A live session reports a restore.
+        list.set_archived("shelved", false);
+        list.send(SessionListUpdate::SessionInfo {
+            session_id: acp::SessionId::new("shelved"),
+            update: info_update(serde_json::json!({"_meta": {"gorynych/archived": false}})),
+        });
+        cx.run_until_parked();
+        assert_eq!(is_archived("shelved", cx), Some(false));
+
+        // Following the agent tells it nothing back.
+        assert!(list.requests().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_archiving_in_zed_reaches_the_agent_without_echo(cx: &mut TestAppContext) {
+        let auto_import = init_test(cx);
+        let list = FakeSessionList::with_archive(true, vec![session("s1", "First", "/project", 1)]);
+        watch(&auto_import, &list, cx);
+        let thread_id = thread("s1", cx).expect("imported").thread_id;
+
+        update_store(cx, |store, cx| store.archive(thread_id, None, cx));
+        assert_eq!(list.requests(), [request("s1", true)]);
+
+        // Later changes to the thread don't repeat the request, and the agent
+        // reporting the archive, in a listing or live, doesn't bounce it back.
+        update_store(cx, |store, cx| {
+            store.update_interacted_at(&thread_id, Utc::now(), cx)
+        });
+        list.refresh(cx);
+        list.send(SessionListUpdate::SessionInfo {
+            session_id: acp::SessionId::new("s1"),
+            update: info_update(serde_json::json!({"_meta": {"gorynych/archived": true}})),
+        });
+        cx.run_until_parked();
+        assert_eq!(list.requests(), [request("s1", true)]);
+        assert_eq!(is_archived("s1", cx), Some(true));
+
+        // Opening an archived thread restores it in stock Zed, so the agent hears
+        // of that too.
+        update_store(cx, |store, cx| store.unarchive(thread_id, cx));
+        list.refresh(cx);
+        assert_eq!(list.requests(), [request("s1", true), request("s1", false)]);
+        assert_eq!(is_archived("s1", cx), Some(false));
+    }
+
+    #[gpui::test]
+    async fn test_failed_archive_requests_leave_the_thread_archived(cx: &mut TestAppContext) {
+        let auto_import = init_test(cx);
+        let list = FakeSessionList::with_archive(true, vec![session("s1", "First", "/project", 1)]);
+        watch(&auto_import, &list, cx);
+        let thread_id = thread("s1", cx).expect("imported").thread_id;
+
+        list.fail_archive_requests.set(true);
+        update_store(cx, |store, cx| store.archive(thread_id, None, cx));
+        update_store(cx, |store, cx| {
+            store.update_interacted_at(&thread_id, Utc::now(), cx)
+        });
+        assert_eq!(list.requests(), [request("s1", true)]);
+        assert_eq!(is_archived("s1", cx), Some(true));
+
+        // The next listing still has the session unarchived, so it is asked again.
+        list.fail_archive_requests.set(false);
+        list.refresh(cx);
+        assert_eq!(list.requests(), [request("s1", true), request("s1", true)]);
+        assert_eq!(is_archived("s1", cx), Some(true));
+    }
+
+    #[gpui::test]
+    async fn test_threads_archived_before_their_agent_reported_flags_reach_it(
+        cx: &mut TestAppContext,
+    ) {
+        let auto_import = init_test(cx);
+        save_thread("archived-in-zed", Some("/project"), true, cx);
+        save_thread("no-folder", None, true, cx);
+        let list = FakeSessionList::with_archive(
+            true,
+            vec![
+                session("archived-in-zed", "Archived in Zed", "/project", 1),
+                session("no-folder", "No folder", "/project", 2),
+            ],
+        );
+        watch(&auto_import, &list, cx);
+
+        // Zed archives threads without a folder on its own, so they aren't the
+        // user's archive.
+        assert_eq!(list.requests(), [request("archived-in-zed", true)]);
+        assert_eq!(is_archived("archived-in-zed", cx), Some(true));
+        assert_eq!(is_archived("no-folder", cx), Some(true));
+    }
+
+    #[gpui::test]
+    async fn test_threads_restored_while_their_agent_is_away_reach_it_later(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            ThreadMetadataStore::init_global(cx);
+        });
+        let db = SessionAutoImportDb(
+            db::open_test_db::<SessionAutoImportDb>("test_threads_restored_while_away").await,
+        );
+        let auto_import = cx.new(|cx| SessionAutoImport::with_db(db.clone(), cx));
+        let list = FakeSessionList::with_archive(
+            true,
+            vec![archived(session("s1", "First", "/project", 1))],
+        );
+        watch(&auto_import, &list, cx);
+        let thread_id = thread("s1", cx).expect("imported").thread_id;
+        assert_eq!(is_archived("s1", cx), Some(true));
+
+        // Zed restarts, and the user restores the thread before the agent is back.
+        drop(list);
+        drop(auto_import);
+        cx.run_until_parked();
+        let auto_import = cx.new(|cx| SessionAutoImport::with_db(db, cx));
+        cx.run_until_parked();
+        update_store(cx, |store, cx| store.unarchive(thread_id, cx));
+
+        let list = FakeSessionList::with_archive(
+            true,
+            vec![archived(session("s1", "First", "/project", 1))],
+        );
+        watch(&auto_import, &list, cx);
+        assert_eq!(list.requests(), [request("s1", false)]);
+        assert_eq!(is_archived("s1", cx), Some(false));
+    }
+
+    #[gpui::test]
+    async fn test_complete_listings_keep_sessions_archived_elsewhere(cx: &mut TestAppContext) {
+        let auto_import = init_test(cx);
+        let list = FakeSessionList::with_archive(
+            false,
+            vec![
+                session("archived-elsewhere", "Archived elsewhere", "/project", 1),
+                session("gone", "Gone", "/project", 2),
+            ],
+        );
+        watch(&auto_import, &list, cx);
+
+        list.set_archived("archived-elsewhere", true);
+        list.sessions
+            .borrow_mut()
+            .retain(|session| session.session_id.0.as_ref() != "gone");
+        cx.executor().advance_clock(POLL_INTERVAL);
+        cx.run_until_parked();
+
+        assert_eq!(is_archived("archived-elsewhere", cx), Some(true));
+        assert!(thread("gone", cx).is_none());
+        assert!(list.requests().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_agents_without_an_archive_leave_archiving_to_zed(cx: &mut TestAppContext) {
+        let auto_import = init_test(cx);
+        // The flag means nothing without the advertisement.
+        let list =
+            FakeSessionList::new(true, vec![archived(session("s1", "First", "/project", 1))]);
+        watch(&auto_import, &list, cx);
+        assert!(list.listing_metas.borrow().iter().all(Option::is_none));
+        assert_eq!(is_archived("s1", cx), Some(false));
+
+        let thread_id = thread("s1", cx).expect("imported").thread_id;
+        update_store(cx, |store, cx| store.archive(thread_id, None, cx));
+        list.send(SessionListUpdate::SessionInfo {
+            session_id: acp::SessionId::new("s1"),
+            update: info_update(serde_json::json!({"_meta": {"gorynych/archived": false}})),
+        });
+        list.refresh(cx);
+        assert_eq!(is_archived("s1", cx), Some(true));
+        assert!(list.requests().is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_archive() {
+        // Both sides agree.
+        assert_eq!(
+            reconcile_archive(true, Some(false), true),
+            ArchiveSync::InSync
+        );
+        // The agent changed its flag.
+        assert_eq!(
+            reconcile_archive(false, Some(false), true),
+            ArchiveSync::Apply(true)
+        );
+        assert_eq!(
+            reconcile_archive(true, Some(true), false),
+            ArchiveSync::Apply(false)
+        );
+        // The user changed the thread.
+        assert_eq!(
+            reconcile_archive(true, Some(false), false),
+            ArchiveSync::Send(true)
+        );
+        assert_eq!(
+            reconcile_archive(false, Some(true), true),
+            ArchiveSync::Send(false)
+        );
+        // Without an earlier report, an archive on either side wins.
+        assert_eq!(
+            reconcile_archive(true, None, false),
+            ArchiveSync::Send(true)
+        );
+        assert_eq!(
+            reconcile_archive(false, None, true),
+            ArchiveSync::Apply(true)
+        );
+    }
+
     #[gpui::test]
     async fn test_watching_stops_when_the_session_list_is_dropped(cx: &mut TestAppContext) {
         let auto_import = init_test(cx);
@@ -1521,6 +2175,7 @@ mod tests {
                     session("new", "New", "/project", 2),
                 ],
                 complete: true,
+                archive: false,
             },
             &HashMap::default(),
             &HashMap::default(),
@@ -1536,7 +2191,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["new"]
         );
-        assert_eq!(plan.known, [(acp::SessionId::new("new"), true)]);
+        assert_eq!(
+            plan.known,
+            [(
+                acp::SessionId::new("new"),
+                KnownSession {
+                    imported: true,
+                    archived: None
+                }
+            )]
+        );
     }
 
     #[test]
@@ -1556,7 +2220,13 @@ mod tests {
         };
         let session_id = acp::SessionId::new("old");
         let threads = HashMap::from_iter([(&session_id, &thread)]);
-        let known = HashMap::from_iter([(session_id.clone(), true)]);
+        let known = HashMap::from_iter([(
+            session_id.clone(),
+            KnownSession {
+                imported: true,
+                archived: None,
+            },
+        )]);
         let plan = |complete| {
             plan_sync(
                 &AgentId::new("gorynych"),
@@ -1564,6 +2234,7 @@ mod tests {
                 SessionListing {
                     sessions: Vec::new(),
                     complete,
+                    archive: false,
                 },
                 &threads,
                 &known,

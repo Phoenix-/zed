@@ -1,17 +1,35 @@
-//! Agent-pushed changes to the session list.
+//! Gorynych extensions to the session list, each advertised in the `_meta` of the
+//! agent's `initialize` response.
 //!
-//! ACP has no notification for changes to `session/list`, so clients have to poll it.
-//! Gorynych extends the protocol with `_gorynych/sessions_changed` and advertises it in
-//! the `_meta` of its `initialize` response.
+//! ACP has no notification for changes to `session/list`, so clients have to poll it;
+//! Gorynych pushes them with `_gorynych/sessions_changed`. It also keeps an archived
+//! flag for its sessions, which clients set with `_gorynych/archive`.
 
-use agent_client_protocol::{JsonRpcNotification, schema::v1 as acp, schema::v2 as acp_v2};
-use gpui::AsyncApp;
+use agent_client_protocol::{
+    JsonRpcNotification, JsonRpcRequest, schema::v1 as acp, schema::v2 as acp_v2,
+};
+use anyhow::{Result, anyhow};
+use gpui::{App, AsyncApp, Task};
 use serde::{Deserialize, Serialize};
 
 use super::{AcpSessionList, ClientContext};
 
 /// Key in the `initialize` response `_meta` that advertises [`SessionsChangedNotification`].
 pub const SESSIONS_CHANGED_META_KEY: &str = "gorynych/sessionsChanged";
+
+/// Key in the `initialize` response `_meta` that advertises the session archive:
+/// archived flags in the `_meta` of sessions, listings that include archived
+/// sessions on request, and [`ArchiveSessionRequest`].
+pub const ARCHIVE_META_KEY: &str = "gorynych/archive";
+
+/// Archives or restores a session. Archiving neither closes nor unloads it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_gorynych/archive", response = serde_json::Value)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveSessionRequest {
+    pub session_id: String,
+    pub archived: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
 #[notification(method = "_gorynych/sessions_changed")]
@@ -32,7 +50,15 @@ pub enum SessionChange {
 }
 
 pub(super) fn advertises_sessions_changed(meta: Option<&acp::Meta>) -> bool {
-    meta.and_then(|meta| meta.get(SESSIONS_CHANGED_META_KEY))
+    advertises(meta, SESSIONS_CHANGED_META_KEY)
+}
+
+pub(super) fn advertises_archive(meta: Option<&acp::Meta>) -> bool {
+    advertises(meta, ARCHIVE_META_KEY)
+}
+
+fn advertises(meta: Option<&acp::Meta>, key: &str) -> bool {
+    meta.and_then(|meta| meta.get(key))
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
 }
@@ -69,6 +95,30 @@ impl AcpSessionList {
             log::warn!("Failed to forward a session list change: {error}");
         }
     }
+
+    pub(super) fn send_archive_request(
+        &self,
+        session_id: &acp_v2::SessionId,
+        archived: bool,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        if !self.supports_archive {
+            return Task::ready(Err(anyhow!("the agent has no session archive")));
+        }
+        let connection = self.connection.clone();
+        let request = ArchiveSessionRequest {
+            session_id: session_id.0.to_string(),
+            archived,
+        };
+        cx.foreground_executor().spawn(async move {
+            connection
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(crate::acp::map_acp_error)?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -76,19 +126,119 @@ mod tests {
     use super::*;
     use crate::acp::{ForegroundWork, drain_foreground_queue, v1::connect_client_future};
     use acp_thread::{AgentSessionList as _, SessionListUpdate};
-    use agent_client_protocol::{Agent, ConnectionTo};
+    use agent_client_protocol::{Agent, Client, ConnectionTo};
     use collections::HashMap;
     use futures::{StreamExt as _, channel::mpsc};
     use gpui::AppContext as _;
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::{Arc, Mutex},
+    };
 
     #[test]
     fn test_advertises_sessions_changed() {
         assert!(!advertises_sessions_changed(None));
         let meta = acp::Meta::from_iter([(SESSIONS_CHANGED_META_KEY.into(), true.into())]);
         assert!(advertises_sessions_changed(Some(&meta)));
+        assert!(!advertises_archive(Some(&meta)));
         let meta = acp::Meta::from_iter([(SESSIONS_CHANGED_META_KEY.into(), "yes".into())]);
         assert!(!advertises_sessions_changed(Some(&meta)));
+        let meta = acp::Meta::from_iter([(ARCHIVE_META_KEY.into(), true.into())]);
+        assert!(advertises_archive(Some(&meta)));
+    }
+
+    #[gpui::test]
+    async fn test_archive_requests_and_listing_meta_reach_the_agent(cx: &mut gpui::TestAppContext) {
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let archive_requests = Arc::new(Mutex::new(Vec::new()));
+        let listing_metas = Arc::new(Mutex::new(Vec::new()));
+        let _agent_task = cx.background_spawn(
+            Agent
+                .builder()
+                .name("archive-agent")
+                .on_receive_request(
+                    {
+                        let archive_requests = archive_requests.clone();
+                        async move |request: ArchiveSessionRequest, responder, _cx| {
+                            let known = request.session_id == "known";
+                            archive_requests
+                                .lock()
+                                .expect("archive requests")
+                                .push((request.session_id, request.archived));
+                            if known {
+                                responder.respond(serde_json::json!({}))
+                            } else {
+                                responder.respond_with_error(acp::Error::resource_not_found(None))
+                            }
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        let listing_metas = listing_metas.clone();
+                        async move |request: acp::ListSessionsRequest, responder, _cx| {
+                            listing_metas
+                                .lock()
+                                .expect("listing metas")
+                                .push(request.meta);
+                            responder.respond(acp::ListSessionsResponse::new(Vec::new()))
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_transport),
+        );
+        let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
+        let _client_task =
+            cx.background_spawn(Client.builder().name("archive-client").connect_with(
+                client_transport,
+                move |connection: ConnectionTo<Agent>| async move {
+                    connection_tx.send(connection).ok();
+                    futures::future::pending::<Result<(), acp::Error>>().await
+                },
+            ));
+        let connection = connection_rx.await.expect("client connection");
+
+        let mut session_list = AcpSessionList::new(connection, false);
+        let known = acp_v2::SessionId::new("known");
+        cx.update(|cx| session_list.set_session_archived(&known, true, cx))
+            .await
+            .expect_err("an agent that doesn't advertise the archive gets no requests");
+
+        session_list.supports_archive = true;
+        cx.update(|cx| session_list.set_session_archived(&known, true, cx))
+            .await
+            .expect("archive a known session");
+        let error = cx
+            .update(|cx| {
+                session_list.set_session_archived(&acp_v2::SessionId::new("unknown"), false, cx)
+            })
+            .await
+            .expect_err("restore an unknown session");
+        assert_eq!(
+            acp_thread::ProtocolErrorInfo::from_error(&error).map(|info| info.code),
+            Some(-32002)
+        );
+        assert_eq!(
+            *archive_requests.lock().expect("archive requests"),
+            [("known".to_string(), true), ("unknown".to_string(), false)]
+        );
+
+        let meta = acp_v2::Meta::from_iter([("gorynych/includeArchived".into(), true.into())]);
+        cx.update(|cx| {
+            session_list.list_sessions(
+                acp_thread::AgentSessionListRequest {
+                    meta: Some(meta.clone()),
+                    ..Default::default()
+                },
+                cx,
+            )
+        })
+        .await
+        .expect("list sessions");
+        assert_eq!(*listing_metas.lock().expect("listing metas"), [Some(meta)]);
     }
 
     #[gpui::test]

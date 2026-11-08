@@ -16306,6 +16306,32 @@ async fn test_toggling_a_thread_tree_keeps_the_selection_on_a_shown_row(cx: &mut
 }
 
 #[gpui::test]
+async fn test_children_of_archived_threads_name_their_parent(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    cx.update(agent_ui::thread_parent_store::ThreadParentStore::init_global);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    save_thread_chain(&project, cx);
+
+    let coordinator = thread_id_for_session("coordinator", cx);
+    cx.update(|_window, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| store.archive(coordinator, None, cx))
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  v Coder (from Coordinator (archived))",
+            "    Reviewer",
+            "  Solo"
+        ]
+    );
+}
+
+#[gpui::test]
 async fn test_child_threads_in_another_project_show_their_parent(cx: &mut TestAppContext) {
     let (fs, project_a) = init_multi_project_test(&["/project-a", "/project-b"], cx).await;
     cx.update(agent_ui::thread_parent_store::ThreadParentStore::init_global);

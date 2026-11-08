@@ -243,6 +243,7 @@ pub struct AcpSessionList {
     connection: ConnectionTo<Agent>,
     supports_delete: bool,
     notifies_changes: bool,
+    supports_archive: bool,
     updates_tx: async_channel::Sender<acp_thread::SessionListUpdate>,
     updates_rx: async_channel::Receiver<acp_thread::SessionListUpdate>,
 }
@@ -254,6 +255,7 @@ impl AcpSessionList {
             connection,
             supports_delete,
             notifies_changes: false,
+            supports_archive: false,
             updates_tx: tx,
             updates_rx: rx,
         }
@@ -287,7 +289,8 @@ impl AgentSessionList for AcpSessionList {
         cx.foreground_executor().spawn(async move {
             let acp_request = acp::ListSessionsRequest::new()
                 .cwd(request.cwd)
-                .cursor(request.cursor);
+                .cursor(request.cursor)
+                .meta(request.meta);
             let response = conn
                 .send_request(acp_request)
                 .block_task()
@@ -352,6 +355,19 @@ impl AgentSessionList for AcpSessionList {
 
     fn notifies_changes(&self) -> bool {
         self.notifies_changes
+    }
+
+    fn supports_archive(&self) -> bool {
+        self.supports_archive
+    }
+
+    fn set_session_archived(
+        &self,
+        session_id: &acp_v2::SessionId,
+        archived: bool,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        self.send_archive_request(session_id, archived, cx)
     }
 
     fn notify_refresh(&self) {
@@ -699,6 +715,8 @@ impl AcpConnection {
             let mut list = AcpSessionList::new(connection.clone(), agent_supports_delete);
             list.notifies_changes =
                 session_list_changes::advertises_sessions_changed(response.meta.as_ref());
+            list.supports_archive =
+                session_list_changes::advertises_archive(response.meta.as_ref());
             let list = Rc::new(list);
             *client_session_list.borrow_mut() = Some(list.clone());
             Some(list)

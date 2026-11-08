@@ -572,6 +572,21 @@ pub trait AgentSessionList {
         false
     }
 
+    /// Whether the agent keeps an archived flag for its sessions, which
+    /// [`Self::set_session_archived`] sets.
+    fn supports_archive(&self) -> bool {
+        false
+    }
+
+    fn set_session_archived(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _archived: bool,
+        _cx: &mut App,
+    ) -> Task<Result<()>> {
+        Task::ready(Err(anyhow::anyhow!("set_session_archived not supported")))
+    }
+
     fn notify_refresh(&self) {}
 
     fn into_any(self: Rc<Self>) -> Rc<dyn Any>;

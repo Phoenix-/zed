@@ -275,12 +275,13 @@ pub(crate) fn nest_group_rows(
     }
 }
 
-/// Looks the parent up among all threads, by the same rule as `resolve_parent`.
+/// Looks the parent up among all threads, by the same rule as `resolve_parent`,
+/// and returns its title and whether it is archived.
 fn parent_title(
     metadata_store: &ThreadMetadataStore,
     agent_id: &AgentId,
     parent_session_id: &acp::SessionId,
-) -> Option<SharedString> {
+) -> Option<(SharedString, bool)> {
     let candidates = metadata_store
         .entries()
         .filter(|thread| thread.session_id.as_ref() == Some(parent_session_id))
@@ -292,7 +293,7 @@ fn parent_title(
             [only] => Some(only),
             _ => None,
         })
-        .map(|thread| thread.display_title())
+        .map(|thread| (thread.display_title(), thread.archived))
 }
 
 /// Whether two entries, from different builds of the list, show the same row.
@@ -311,13 +312,17 @@ fn is_same_row(a: &ListEntry, b: &ListEntry) -> bool {
     }
 }
 
-fn parent_hint(parent_title: Option<SharedString>) -> SharedString {
-    match parent_title {
-        Some(title) => format!(
-            "from {}",
-            util::truncate_and_trailoff(&title, MAX_PARENT_TITLE_LEN)
-        )
-        .into(),
+/// An archived parent isn't in the sidebar, so the hint says where it went.
+fn parent_hint(parent: Option<(SharedString, bool)>) -> SharedString {
+    match parent {
+        Some((title, archived)) => {
+            let title = util::truncate_and_trailoff(&title, MAX_PARENT_TITLE_LEN);
+            if archived {
+                format!("from {title} (archived)").into()
+            } else {
+                format!("from {title}").into()
+            }
+        }
         None => "from an unknown thread".into(),
     }
 }
@@ -610,8 +615,12 @@ mod tests {
     #[test]
     fn test_parent_hint() {
         assert_eq!(
-            parent_hint(Some("Coordinator".into())).as_ref(),
+            parent_hint(Some(("Coordinator".into(), false))).as_ref(),
             "from Coordinator"
+        );
+        assert_eq!(
+            parent_hint(Some(("Coordinator".into(), true))).as_ref(),
+            "from Coordinator (archived)"
         );
         assert_eq!(parent_hint(None).as_ref(), "from an unknown thread");
     }
