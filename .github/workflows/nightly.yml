@@ -1,0 +1,115 @@
+# Builds Zed with the Gorynych patches on a self-hosted Windows runner and
+# publishes the result as the rolling `nightly` prerelease.
+#
+# The runner sits on a private machine, so this workflow never runs code from
+# pull requests: it has no pull_request or pull_request_target trigger, and the
+# repository requires approval before workflows from fork pull requests run.
+name: Nightly
+
+on:
+  push:
+    branches: [gorynych]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'Phoenix-/zed' && github.ref == 'refs/heads/gorynych'
+    runs-on: [self-hosted, windows, zed-gorynych]
+    timeout-minutes: 240
+    env:
+      # Outside the runner's workspace, so that builds stay incremental.
+      CARGO_TARGET_DIR: C:\gorynych-ci\target
+      CARGO_HOME: C:\gorynych-ci\cargo
+      RUSTUP_HOME: C:\gorynych-ci\rustup
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      # The dev channel never updates itself to stock Zed, and it keeps its own
+      # database and single-instance lock beside an installed stable Zed.
+      ZED_RELEASE_CHANNEL: dev
+      ASSET: zed-gorynych-windows-x64.zip
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up the toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargoBin = Join-Path $env:CARGO_HOME 'bin'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $cmakeBin = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin'
+          if (-not (Test-Path (Join-Path $cmakeBin 'cmake.exe'))) { throw "No CMake in $vs" }
+          [IO.File]::AppendAllText($env:GITHUB_PATH, "$cargoBin`n$cmakeBin`n")
+          # Installs the toolchain that rust-toolchain.toml names.
+          $ErrorActionPreference = 'Continue'
+          & (Join-Path $cargoBin 'rustup.exe') toolchain install
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cargo build --profile release-fast -p zed
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:CARGO_TARGET_DIR 'release-fast'
+          $stage = Join-Path $env:RUNNER_TEMP 'zed-gorynych'
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          New-Item -ItemType Directory -Path (Join-Path $stage 'x64') | Out-Null
+          # zed.exe runs its terminals through the conpty.dll that its build
+          # downloads next to it; conpty.dll starts OpenConsole.exe.
+          Copy-Item (Join-Path $out 'zed.exe'), (Join-Path $out 'conpty.dll'), (Join-Path $out 'OpenConsole.exe') $stage
+          Copy-Item (Join-Path $out 'OpenConsole.exe') (Join-Path $stage 'x64')
+          $zip = Join-Path $env:RUNNER_TEMP $env:ASSET
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          $ErrorActionPreference = 'Continue'
+          tar.exe -a -c -f $zip -C $env:RUNNER_TEMP zed-gorynych
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Publish the nightly prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $repo = $env:GITHUB_REPOSITORY
+          $sha = $env:GITHUB_SHA
+          $version = (Select-String -Path crates\zed\Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $notes = Join-Path $env:RUNNER_TEMP 'nightly-notes.md'
+          $lines = @(
+            "Zed $version with the Gorynych patches, dev channel, built from $sha.",
+            "",
+            "Unzip and run ``zed-gorynych\zed.exe``. It doesn't update itself.",
+            "",
+            "Build log: $env:GITHUB_SERVER_URL/$repo/actions/runs/$env:GITHUB_RUN_ID"
+          )
+          [IO.File]::WriteAllLines($notes, $lines)
+
+          # Point the nightly tag at this commit.
+          gh api -X PATCH "repos/$repo/git/refs/tags/nightly" -f "sha=$sha" -F force=true --silent
+          if ($LASTEXITCODE) {
+            gh api -X POST "repos/$repo/git/refs" -f ref=refs/tags/nightly -f "sha=$sha" --silent
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+
+          gh release view nightly --repo $repo --json tagName | Out-Null
+          if ($LASTEXITCODE) {
+            gh release create nightly --repo $repo --prerelease --title "Nightly" --notes-file $notes --verify-tag
+          } else {
+            gh release edit nightly --repo $repo --prerelease --title "Nightly" --notes-file $notes
+          }
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+          gh release upload nightly (Join-Path $env:RUNNER_TEMP $env:ASSET) --repo $repo --clobber
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
