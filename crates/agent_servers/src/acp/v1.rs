@@ -713,10 +713,14 @@ impl AcpConnection {
             .is_some()
         {
             let mut list = AcpSessionList::new(connection.clone(), agent_supports_delete);
-            list.notifies_changes =
-                session_list_changes::advertises_sessions_changed(response.meta.as_ref());
-            list.supports_archive =
-                session_list_changes::advertises_archive(response.meta.as_ref());
+            list.notifies_changes = session_list_changes::advertises_sessions_changed(
+                &response.agent_capabilities,
+                response.meta.as_ref(),
+            );
+            list.supports_archive = session_list_changes::advertises_archive(
+                &response.agent_capabilities,
+                response.meta.as_ref(),
+            );
             let list = Rc::new(list);
             *client_session_list.borrow_mut() = Some(list.clone());
             Some(list)
@@ -9214,6 +9218,87 @@ exit 7
             entries,
             vec!["user", "assistant", "compaction"],
             "replayed notifications should be applied to the thread"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_load_session_replays_chunks_by_message_id(cx: &mut gpui::TestAppContext) {
+        use acp_thread::{AgentThreadEntry, AssistantMessageChunk};
+
+        let (
+            connection,
+            project,
+            _load_count,
+            _close_count,
+            load_session_updates,
+            _load_session_gate,
+            _keep_agent_alive,
+        ) = connect_fake_agent(None, cx).await;
+        let chunk = |text: &str, message_id: &str| {
+            acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(text)))
+                .message_id(message_id)
+        };
+        *load_session_updates
+            .lock()
+            .expect("load_session_updates mutex poisoned") = vec![
+            acp::SessionUpdate::UserMessageChunk(chunk("First prompt", "user-1")),
+            acp::SessionUpdate::UserMessageChunk(chunk("Second prompt", "user-2")),
+            acp::SessionUpdate::AgentThoughtChunk(chunk("Thinking", "agent-1")),
+            acp::SessionUpdate::AgentMessageChunk(chunk("Answer ", "agent-1")),
+            acp::SessionUpdate::AgentMessageChunk(chunk("done", "agent-1")),
+            acp::SessionUpdate::AgentMessageChunk(chunk("Follow-up", "agent-2")),
+        ];
+
+        let thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("session-message-ids"),
+                    project.clone(),
+                    util::path_list::PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load_session failed");
+        cx.run_until_parked();
+
+        let entries = thread.read_with(cx, |thread, cx| {
+            thread
+                .entries()
+                .iter()
+                .map(|entry| match entry {
+                    AgentThreadEntry::UserMessage(message) => {
+                        vec![format!("user: {}", message.content.to_markdown(cx))]
+                    }
+                    AgentThreadEntry::AssistantMessage(message) => message
+                        .chunks
+                        .iter()
+                        .map(|chunk| match chunk {
+                            AssistantMessageChunk::Message { block, .. } => {
+                                format!("message: {}", block.to_markdown(cx))
+                            }
+                            AssistantMessageChunk::Thought { block, .. } => {
+                                format!("thought: {}", block.to_markdown(cx))
+                            }
+                        })
+                        .collect(),
+                    _ => vec!["other".to_string()],
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            entries,
+            [
+                vec!["user: First prompt".to_string()],
+                vec!["user: Second prompt".to_string()],
+                vec![
+                    "thought: Thinking".to_string(),
+                    "message: Answer done".to_string(),
+                    "message: Follow-up".to_string(),
+                ],
+            ],
+            "a new message id starts a new message, the same one continues it"
         );
     }
 

@@ -1,5 +1,7 @@
 //! Gorynych extensions to the session list, each advertised in the `_meta` of the
-//! agent's `initialize` response.
+//! agent's capabilities, as ACP does for custom capabilities. Earlier Gorynych
+//! releases advertised them in the `_meta` of the `initialize` response, which is
+//! still read when the capabilities don't name a flag.
 //!
 //! ACP has no notification for changes to `session/list`, so clients have to poll it;
 //! Gorynych pushes them with `_gorynych/sessions_changed`. It also keeps an archived
@@ -14,10 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{AcpSessionList, ClientContext};
 
-/// Key in the `initialize` response `_meta` that advertises [`SessionsChangedNotification`].
+/// Key in the agent capabilities `_meta` that advertises [`SessionsChangedNotification`].
 pub const SESSIONS_CHANGED_META_KEY: &str = "gorynych/sessionsChanged";
 
-/// Key in the `initialize` response `_meta` that advertises the session archive:
+/// Key in the agent capabilities `_meta` that advertises the session archive:
 /// archived flags in the `_meta` of sessions, listings that include archived
 /// sessions on request, and [`ArchiveSessionRequest`].
 pub const ARCHIVE_META_KEY: &str = "gorynych/archive";
@@ -49,17 +51,33 @@ pub enum SessionChange {
     Unknown,
 }
 
-pub(super) fn advertises_sessions_changed(meta: Option<&acp::Meta>) -> bool {
-    advertises(meta, SESSIONS_CHANGED_META_KEY)
+pub(super) fn advertises_sessions_changed(
+    capabilities: &acp::AgentCapabilities,
+    response_meta: Option<&acp::Meta>,
+) -> bool {
+    advertises(capabilities, response_meta, SESSIONS_CHANGED_META_KEY)
 }
 
-pub(super) fn advertises_archive(meta: Option<&acp::Meta>) -> bool {
-    advertises(meta, ARCHIVE_META_KEY)
+pub(super) fn advertises_archive(
+    capabilities: &acp::AgentCapabilities,
+    response_meta: Option<&acp::Meta>,
+) -> bool {
+    advertises(capabilities, response_meta, ARCHIVE_META_KEY)
 }
 
-fn advertises(meta: Option<&acp::Meta>, key: &str) -> bool {
-    meta.and_then(|meta| meta.get(key))
-        .and_then(|value| value.as_bool())
+/// Reads a flag from the capabilities `_meta`, falling back to the `_meta` of the
+/// `initialize` response.
+fn advertises(
+    capabilities: &acp::AgentCapabilities,
+    response_meta: Option<&acp::Meta>,
+    key: &str,
+) -> bool {
+    let flag = |meta: Option<&acp::Meta>| {
+        meta.and_then(|meta| meta.get(key))
+            .and_then(|value| value.as_bool())
+    };
+    flag(capabilities.meta.as_ref())
+        .or_else(|| flag(response_meta))
         .unwrap_or(false)
 }
 
@@ -137,15 +155,45 @@ mod tests {
     };
 
     #[test]
-    fn test_advertises_sessions_changed() {
-        assert!(!advertises_sessions_changed(None));
-        let meta = acp::Meta::from_iter([(SESSIONS_CHANGED_META_KEY.into(), true.into())]);
-        assert!(advertises_sessions_changed(Some(&meta)));
-        assert!(!advertises_archive(Some(&meta)));
-        let meta = acp::Meta::from_iter([(SESSIONS_CHANGED_META_KEY.into(), "yes".into())]);
-        assert!(!advertises_sessions_changed(Some(&meta)));
-        let meta = acp::Meta::from_iter([(ARCHIVE_META_KEY.into(), true.into())]);
-        assert!(advertises_archive(Some(&meta)));
+    fn test_advertised_flags() {
+        let meta = |entries: &[(&str, serde_json::Value)]| {
+            acp::Meta::from_iter(
+                entries
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.clone())),
+            )
+        };
+        let capabilities = |entries: &[(&str, serde_json::Value)]| {
+            acp::AgentCapabilities::new().meta(meta(entries))
+        };
+        let none = acp::AgentCapabilities::new();
+
+        assert!(!advertises_sessions_changed(&none, None));
+        assert!(!advertises_archive(&none, None));
+
+        // Where ACP puts custom capabilities.
+        let both = capabilities(&[
+            (SESSIONS_CHANGED_META_KEY, true.into()),
+            (ARCHIVE_META_KEY, true.into()),
+        ]);
+        assert!(advertises_sessions_changed(&both, None));
+        assert!(advertises_archive(&both, None));
+        let archive_only = capabilities(&[(ARCHIVE_META_KEY, true.into())]);
+        assert!(!advertises_sessions_changed(&archive_only, None));
+        assert!(advertises_archive(&archive_only, None));
+        let not_a_bool = capabilities(&[(SESSIONS_CHANGED_META_KEY, "yes".into())]);
+        assert!(!advertises_sessions_changed(&not_a_bool, None));
+
+        // Where earlier releases put them.
+        let old_place = meta(&[(SESSIONS_CHANGED_META_KEY, true.into())]);
+        assert!(advertises_sessions_changed(&none, Some(&old_place)));
+        assert!(!advertises_archive(&none, Some(&old_place)));
+        assert!(advertises_sessions_changed(&archive_only, Some(&old_place)));
+
+        // The capabilities win when both places name a flag.
+        let withdrawn = capabilities(&[(ARCHIVE_META_KEY, false.into())]);
+        let old_place = meta(&[(ARCHIVE_META_KEY, true.into())]);
+        assert!(!advertises_archive(&withdrawn, Some(&old_place)));
     }
 
     #[gpui::test]
