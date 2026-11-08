@@ -1979,7 +1979,6 @@ impl Sidebar {
                     &mut entries,
                     group_start,
                     &HashSet::new(),
-                    None,
                     &mut thread_tree,
                     cx,
                 );
@@ -2038,7 +2037,6 @@ impl Sidebar {
                     &mut entries,
                     group_start,
                     &self.collapsed_thread_trees,
-                    thread_tree::active_thread_id(self.active_entry.as_ref()),
                     &mut thread_tree,
                     cx,
                 );

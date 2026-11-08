@@ -16,7 +16,7 @@ use gpui::{AnyElement, App, Context, Pixels, SharedString, px};
 use project::AgentId;
 use ui::{Disclosure, prelude::*};
 
-use crate::{ActiveEntry, DraftKind, ListEntry, Sidebar};
+use crate::{DraftKind, ListEntry, Sidebar};
 
 const INDENT_PER_LEVEL: Pixels = px(12.);
 const DISCLOSURE_WIDTH: Pixels = px(16.);
@@ -41,8 +41,6 @@ pub(crate) struct TreeNode {
     pub parent_session_id: Option<acp::SessionId>,
     pub sort_time: DateTime<Utc>,
     pub collapsed: bool,
-    /// Shown even under a collapsed parent, as the active thread is.
-    pub keep_visible: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -82,8 +80,7 @@ fn resolve_parent(
 
 /// Orders `nodes` so that each one follows its parent, most recent first among
 /// siblings. A subtree is as recent as its most recent node. Descendants of
-/// collapsed nodes are left out, except the ones on the way to a node that is
-/// kept visible.
+/// collapsed nodes are left out.
 pub(crate) fn arrange(nodes: &[TreeNode]) -> Vec<TreePlacement> {
     let mut index_by_session = HashMap::<&acp::SessionId, Vec<usize>>::new();
     for (index, node) in nodes.iter().enumerate() {
@@ -117,16 +114,13 @@ pub(crate) fn arrange(nodes: &[TreeNode]) -> Vec<TreePlacement> {
         }
     }
 
-    let mut subtrees = vec![None; nodes.len()];
+    let mut subtree_times = vec![None; nodes.len()];
     for index in 0..nodes.len() {
-        subtree_summary(index, nodes, &children, &mut subtrees);
+        subtree_time(index, nodes, &children, &mut subtree_times);
     }
-    let subtree_time = |index: usize| subtrees[index].map(|summary: SubtreeSummary| summary.time);
-    let holds_visible =
-        |index: usize| subtrees[index].is_some_and(|summary: SubtreeSummary| summary.holds_visible);
     let by_recency = |a: &usize, b: &usize| {
-        subtree_time(*b)
-            .cmp(&subtree_time(*a))
+        subtree_times[*b]
+            .cmp(&subtree_times[*a])
             .then_with(|| a.cmp(b))
     };
     roots.sort_by(by_recency);
@@ -147,51 +141,35 @@ pub(crate) fn arrange(nodes: &[TreeNode]) -> Vec<TreePlacement> {
             child_count: children[index].len(),
             detached: nodes[index].parent_session_id.is_some() && parents[index].is_none(),
         });
-        let collapsed = nodes[index].collapsed;
-        stack.extend(
-            children[index]
-                .iter()
-                .rev()
-                .filter(|child| !collapsed || holds_visible(**child))
-                .map(|child| (*child, depth + 1)),
-        );
+        // Like a collapsed project group, a collapsed thread hides all of its
+        // descendants, the active thread included.
+        if !nodes[index].collapsed {
+            stack.extend(
+                children[index]
+                    .iter()
+                    .rev()
+                    .map(|child| (*child, depth + 1)),
+            );
+        }
     }
     placements
 }
 
-#[derive(Clone, Copy)]
-struct SubtreeSummary {
-    time: DateTime<Utc>,
-    holds_visible: bool,
-}
-
-fn subtree_summary(
+fn subtree_time(
     index: usize,
     nodes: &[TreeNode],
     children: &[Vec<usize>],
-    subtrees: &mut Vec<Option<SubtreeSummary>>,
-) -> SubtreeSummary {
-    if let Some(summary) = subtrees[index] {
-        return summary;
+    subtree_times: &mut Vec<Option<DateTime<Utc>>>,
+) -> DateTime<Utc> {
+    if let Some(time) = subtree_times[index] {
+        return time;
     }
-    let mut summary = SubtreeSummary {
-        time: nodes[index].sort_time,
-        holds_visible: nodes[index].keep_visible,
-    };
+    let mut time = nodes[index].sort_time;
     for child in &children[index] {
-        let child = subtree_summary(*child, nodes, children, subtrees);
-        summary.time = summary.time.max(child.time);
-        summary.holds_visible |= child.holds_visible;
+        time = time.max(subtree_time(*child, nodes, children, subtree_times));
     }
-    subtrees[index] = Some(summary);
-    summary
-}
-
-pub(crate) fn active_thread_id(active_entry: Option<&ActiveEntry>) -> Option<ThreadId> {
-    match active_entry? {
-        ActiveEntry::Thread { thread_id, .. } => Some(*thread_id),
-        ActiveEntry::Terminal { .. } => None,
-    }
+    subtree_times[index] = Some(time);
+    time
 }
 
 /// Nests the rows of one project group, pushed to `entries` from `group_start`
@@ -200,7 +178,6 @@ pub(crate) fn nest_group_rows(
     entries: &mut Vec<ListEntry>,
     group_start: usize,
     collapsed_threads: &HashSet<ThreadId>,
-    active_thread_id: Option<ThreadId>,
     tree_rows: &mut HashMap<ThreadId, ThreadTreeRow>,
     cx: &App,
 ) {
@@ -240,7 +217,6 @@ pub(crate) fn nest_group_rows(
                     Sidebar::thread_display_time(&thread.metadata)
                 },
                 collapsed: collapsed_threads.contains(&thread.metadata.thread_id),
-                keep_visible: active_thread_id == Some(thread.metadata.thread_id),
             },
             ListEntry::Terminal(terminal) => TreeNode {
                 agent_id: None,
@@ -248,7 +224,6 @@ pub(crate) fn nest_group_rows(
                 parent_session_id: None,
                 sort_time: terminal.metadata.created_at,
                 collapsed: false,
-                keep_visible: false,
             },
             ListEntry::ProjectHeader { .. } => TreeNode {
                 agent_id: None,
@@ -256,7 +231,6 @@ pub(crate) fn nest_group_rows(
                 parent_session_id: None,
                 sort_time: DateTime::<Utc>::MAX_UTC,
                 collapsed: false,
-                keep_visible: false,
             },
         })
         .collect::<Vec<_>>();
@@ -321,6 +295,22 @@ fn parent_title(
         .map(|thread| thread.display_title())
 }
 
+/// Whether two entries, from different builds of the list, show the same row.
+fn is_same_row(a: &ListEntry, b: &ListEntry) -> bool {
+    match (a, b) {
+        (ListEntry::ProjectHeader { key: a, .. }, ListEntry::ProjectHeader { key: b, .. }) => {
+            a == b
+        }
+        (ListEntry::Thread(a), ListEntry::Thread(b)) => {
+            a.metadata.thread_id == b.metadata.thread_id
+        }
+        (ListEntry::Terminal(a), ListEntry::Terminal(b)) => {
+            a.metadata.terminal_id == b.metadata.terminal_id
+        }
+        _ => false,
+    }
+}
+
 fn parent_hint(parent_title: Option<SharedString>) -> SharedString {
     match parent_title {
         Some(title) => format!(
@@ -344,7 +334,24 @@ impl Sidebar {
         if !self.collapsed_thread_trees.remove(&thread_id) {
             self.collapsed_thread_trees.insert(thread_id);
         }
+        let selected = self
+            .selection
+            .and_then(|ix| self.contents.entries.get(ix))
+            .cloned();
         self.update_entries(cx);
+        // The rows below the toggled thread move. The selection stays on its
+        // row, or moves to the toggled thread when that row is now hidden.
+        if let Some(selected) = selected {
+            let entries = &self.contents.entries;
+            let is_toggled_thread = |entry: &ListEntry| match entry {
+                ListEntry::Thread(thread) => thread.metadata.thread_id == thread_id,
+                ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => false,
+            };
+            self.selection = entries
+                .iter()
+                .position(|entry| is_same_row(entry, &selected))
+                .or_else(|| entries.iter().position(is_toggled_thread));
+        }
     }
 
     fn selected_thread_tree_row(&self, ix: usize) -> Option<(ThreadId, ThreadTreeRow)> {
@@ -472,7 +479,6 @@ mod tests {
                 .expect("timestamp")
                 .with_timezone(&Utc),
             collapsed: false,
-            keep_visible: false,
         }
     }
 
@@ -553,22 +559,6 @@ mod tests {
         nodes[0].collapsed = false;
         nodes[1].collapsed = true;
         assert_eq!(outline(&nodes), ["coordinator (1)", "  coder (1)", "other"]);
-    }
-
-    #[test]
-    fn test_active_threads_stay_visible_under_collapsed_parents() {
-        let mut nodes = vec![
-            node("coordinator", None, 10),
-            node("coder", Some("coordinator"), 20),
-            node("reviewer", Some("coder"), 30),
-            node("other-coder", Some("coordinator"), 25),
-        ];
-        nodes[0].collapsed = true;
-        nodes[2].keep_visible = true;
-        assert_eq!(
-            outline(&nodes),
-            ["coordinator (2)", "  coder (1)", "    reviewer"]
-        );
     }
 
     #[test]

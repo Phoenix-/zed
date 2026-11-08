@@ -16184,37 +16184,124 @@ async fn test_keyboard_navigates_thread_trees(cx: &mut TestAppContext) {
     );
 }
 
+/// Saves Solo and a Coordinator → Coder → Reviewer chain, Reviewer most recent.
+fn save_thread_chain(project: &Entity<project::Project>, cx: &mut TestAppContext) {
+    save_minute_thread("solo", "Solo", 0, project, cx);
+    save_minute_thread("coordinator", "Coordinator", 1, project, cx);
+    save_minute_thread("coder", "Coder", 2, project, cx);
+    save_minute_thread("reviewer", "Reviewer", 3, project, cx);
+    set_thread_parent("coder", "coordinator", cx);
+    set_thread_parent("reviewer", "coder", cx);
+}
+
 #[gpui::test]
-async fn test_the_active_thread_stays_visible_under_a_collapsed_parent(cx: &mut TestAppContext) {
+async fn test_collapsed_parents_hide_the_active_thread(cx: &mut TestAppContext) {
     let project = init_test_project("/my-project", cx).await;
     cx.update(agent_ui::thread_parent_store::ThreadParentStore::init_global);
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
     let sidebar = setup_sidebar(&multi_workspace, cx);
-
-    save_minute_thread("coordinator", "Coordinator", 1, &project, cx);
-    save_minute_thread("coder", "Coder", 2, &project, cx);
-    save_minute_thread("reviewer", "Reviewer", 3, &project, cx);
-    set_thread_parent("coder", "coordinator", cx);
-    set_thread_parent("reviewer", "coordinator", cx);
+    save_thread_chain(&project, cx);
 
     let workspace =
         multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
-    let coder = thread_id_for_session("coder", cx);
     let coordinator = thread_id_for_session("coordinator", cx);
-    sidebar.update(cx, |sidebar, cx| {
-        sidebar.active_entry = Some(ActiveEntry::Thread {
-            thread_id: coder,
-            session_id: Some(acp::SessionId::new("coder")),
-            workspace,
+    let reviewer = thread_id_for_session("reviewer", cx);
+    for active_thread in [None, Some(reviewer)] {
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.active_entry = active_thread.map(|thread_id| ActiveEntry::Thread {
+                thread_id,
+                session_id: Some(acp::SessionId::new("reviewer")),
+                workspace: workspace.clone(),
+            });
+            sidebar.toggle_thread_tree(coordinator, cx);
         });
+        cx.run_until_parked();
+        assert_eq!(
+            visible_entries_as_strings(&sidebar, cx),
+            vec!["v [my-project]", "  > Coordinator", "  Solo"],
+            "active thread: {active_thread:?}"
+        );
+
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.toggle_thread_tree(coordinator, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            visible_entries_as_strings(&sidebar, cx),
+            vec![
+                "v [my-project]",
+                "  v Coordinator",
+                "    v Coder",
+                "      Reviewer",
+                "  Solo"
+            ]
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_toggling_a_thread_tree_keeps_the_selection_on_a_shown_row(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    cx.update(agent_ui::thread_parent_store::ThreadParentStore::init_global);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    save_thread_chain(&project, cx);
+    focus_sidebar(&sidebar, cx);
+    let coordinator = thread_id_for_session("coordinator", cx);
+
+    // A selected thread that gets hidden hands the selection to the thread
+    // that hides it.
+    sidebar.update_in(cx, |sidebar, _window, cx| {
+        sidebar.selection = Some(3);
         sidebar.toggle_thread_tree(coordinator, cx);
     });
     cx.run_until_parked();
-
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec!["v [my-project]", "  > Coordinator", "    Coder"]
+        vec!["v [my-project]", "  > Coordinator  <== selected", "  Solo"]
+    );
+
+    // The keyboard carries on from there.
+    cx.dispatch_action(SelectChild);
+    cx.run_until_parked();
+    cx.dispatch_action(SelectChild);
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  v Coordinator",
+            "    v Coder  <== selected",
+            "      Reviewer",
+            "  Solo"
+        ]
+    );
+
+    // A selected row below the toggled thread stays selected as it moves.
+    sidebar.update_in(cx, |sidebar, _window, cx| {
+        sidebar.selection = Some(4);
+        sidebar.toggle_thread_tree(coordinator, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  > Coordinator", "  Solo  <== selected"]
+    );
+    sidebar.update_in(cx, |sidebar, _window, cx| {
+        sidebar.toggle_thread_tree(coordinator, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  v Coordinator",
+            "    v Coder",
+            "      Reviewer",
+            "  Solo  <== selected"
+        ]
     );
 }
 
