@@ -250,24 +250,21 @@ impl SessionAutoImport {
         })
         .detach();
 
-        cx.observe_new::<ConversationView>({
+        cx.observe_new::<ConversationView>(move |_view, _window, cx| {
+            let view = cx.weak_entity();
+            let view_id = view.entity_id();
+            this.update(cx, |this, _| {
+                this.conversation_views.insert(view_id, view);
+            })
+            .ok();
             let this = this.clone();
-            move |_view, _window, cx| {
-                let view = cx.weak_entity();
-                let view_id = view.entity_id();
+            cx.on_release(move |_view, cx| {
                 this.update(cx, |this, _| {
-                    this.conversation_views.insert(view_id, view);
+                    this.conversation_views.remove(&view_id);
                 })
                 .ok();
-                let this = this.clone();
-                cx.on_release(move |_view, cx| {
-                    this.update(cx, |this, _| {
-                        this.conversation_views.remove(&view_id);
-                    })
-                    .ok();
-                })
-                .detach();
-            }
+            })
+            .detach();
         })
         .detach();
 
@@ -1655,7 +1652,7 @@ mod tests {
         let archived = thread("s2", cx).expect("s2 imported");
         update_store(cx, |store, cx| store.archive(archived.thread_id, None, cx));
 
-        list.sessions.borrow_mut().truncate(0);
+        list.sessions.borrow_mut().clear();
         for session_id in ["s1", "s2", "unknown"] {
             list.send(SessionListUpdate::SessionRemoved {
                 session_id: acp::SessionId::new(session_id),
