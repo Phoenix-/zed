@@ -5,7 +5,8 @@
 //! through the manual import modal. The agent's session list is read when Zed
 //! connects to it, whenever the agent reports a change, and on a slow timer for
 //! agents that don't report changes. Sessions that an agent reports as started by
-//! another session are linked to their parent, so the sidebar can nest them.
+//! another session are linked to their parent, so the sidebar can nest them, and
+//! sessions it reports as open in another app are marked, so the sidebar can say so.
 //!
 //! Agents that keep an archive of their own (the Gorynych extension advertised by
 //! `gorynych/archive`) share it with Zed's: a session the agent archives or restores
@@ -48,6 +49,7 @@ use util::{ResultExt as _, path_list::PathList};
 use crate::{
     Agent, ConversationView,
     agent_connection_store::{AgentConnectionEntry, AgentConnectionStore},
+    open_elsewhere_store::{OpenElsewhereStore, open_elsewhere_from_meta},
     thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore, WorktreePaths},
     thread_parent_store::{ThreadParentStore, parent_session_id_from_meta},
 };
@@ -379,9 +381,24 @@ impl SessionAutoImport {
     /// connects to enabled agents nobody is connected to yet.
     fn sync_store(&mut self, store: &Entity<AgentConnectionStore>, cx: &mut Context<Self>) {
         let agent_ids = auto_import_agent_ids(cx);
+        let mut unwatched = Vec::new();
         self.watchers.retain(|watcher| {
-            watcher.session_list.strong_count() > 0 && agent_ids.contains(&watcher.agent_id)
+            let keep =
+                watcher.session_list.strong_count() > 0 && agent_ids.contains(&watcher.agent_id);
+            if !keep {
+                unwatched.push(watcher.agent_id.clone());
+            }
+            keep
         });
+        unwatched.retain(|agent_id| {
+            !self
+                .watchers
+                .iter()
+                .any(|watcher| &watcher.agent_id == agent_id)
+        });
+        for agent_id in unwatched {
+            forget_open_elsewhere(&agent_id, cx);
+        }
         self.pending_connections
             .retain(|(agent_id, store)| store.upgrade().is_some() && agent_ids.contains(agent_id));
 
@@ -569,6 +586,21 @@ impl SessionAutoImport {
                 .retain(|(requested_agent, session_id), _| {
                     requested_agent != agent_id || !listed.contains(session_id)
                 });
+        }
+        if let Some(open_elsewhere_store) = OpenElsewhereStore::try_global(cx) {
+            let holders = listing
+                .sessions
+                .iter()
+                .map(|session| {
+                    (
+                        session.session_id.clone(),
+                        open_elsewhere_from_meta(session.meta.as_ref()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            open_elsewhere_store.update(cx, |open_elsewhere_store, cx| {
+                open_elsewhere_store.apply_listing(agent_id, holders, listing.complete, cx);
+            });
         }
         let open_thread_ids = self.open_thread_ids(cx);
         let live_sessions = self.live_sessions(agent_id, cx);
@@ -1153,6 +1185,15 @@ async fn watch_session_list(
             }
         }
     }
+    cx.update(|cx| forget_open_elsewhere(&agent_id, cx));
+}
+
+/// Without a listing to keep them up to date, the marks of an agent's sessions
+/// open in other apps would go stale.
+fn forget_open_elsewhere(agent_id: &AgentId, cx: &mut App) {
+    if let Some(store) = OpenElsewhereStore::try_global(cx) {
+        store.update(cx, |store, cx| store.forget_agent(agent_id, cx));
+    }
 }
 
 enum WatchEvent {
@@ -1483,6 +1524,7 @@ mod tests {
             cx.set_global(settings_store);
             ThreadMetadataStore::init_global(cx);
             ThreadParentStore::init_global(cx);
+            OpenElsewhereStore::init_global(cx);
             cx.new(SessionAutoImport::new)
         });
         // Threads saved before the stores have loaded would be lost on load, which
@@ -1868,6 +1910,66 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(parent("coder", cx).as_deref(), Some("coordinator"));
+    }
+
+    fn open_elsewhere(mut session: AgentSessionInfo, holder: &str) -> AgentSessionInfo {
+        session.meta.get_or_insert_default().insert(
+            crate::open_elsewhere_store::OPEN_ELSEWHERE_META_KEY.into(),
+            holder.into(),
+        );
+        session
+    }
+
+    fn holder(session_id: &str, cx: &TestAppContext) -> Option<String> {
+        cx.read(|cx| {
+            OpenElsewhereStore::try_global(cx)?
+                .read(cx)
+                .holder(&AgentId::new("gorynych"), &acp::SessionId::new(session_id))
+                .map(|holder| holder.to_string())
+        })
+    }
+
+    #[gpui::test]
+    async fn test_listings_mark_sessions_open_in_other_apps(cx: &mut TestAppContext) {
+        let auto_import = init_test(cx);
+        let list = FakeSessionList::new(
+            true,
+            vec![
+                open_elsewhere(
+                    session("desktop", "Desktop", "/project", 1),
+                    "Codex Desktop",
+                ),
+                session("free", "Free", "/project", 2),
+                open_elsewhere(
+                    session("terminal", "Terminal", "/project", 3),
+                    "a terminal codex (pid 20796)",
+                ),
+            ],
+        );
+        watch(&auto_import, &list, cx);
+        assert_eq!(holder("desktop", cx).as_deref(), Some("Codex Desktop"));
+        assert_eq!(holder("free", cx), None);
+        assert_eq!(
+            holder("terminal", cx).as_deref(),
+            Some("a terminal codex (pid 20796)")
+        );
+        // A session open elsewhere is imported like any other.
+        assert!(thread("desktop", cx).is_some_and(|thread| !thread.archived));
+
+        // Each listing is authoritative: closed there, opened elsewhere, gone.
+        *list.sessions.borrow_mut() = vec![
+            session("desktop", "Desktop", "/project", 1),
+            open_elsewhere(session("free", "Free", "/project", 2), "VS Code"),
+        ];
+        list.refresh(cx);
+        assert_eq!(holder("desktop", cx), None);
+        assert_eq!(holder("free", cx).as_deref(), Some("VS Code"));
+        assert_eq!(holder("terminal", cx), None);
+
+        // The marks go when Zed stops hearing from the agent.
+        drop(list);
+        cx.run_until_parked();
+        assert_eq!(holder("free", cx), None);
     }
 
     fn is_archived(session_id: &str, cx: &TestAppContext) -> Option<bool> {

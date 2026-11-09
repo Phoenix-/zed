@@ -683,9 +683,11 @@ fn visible_entries_as_strings(
                             Some(tree) if tree.child_count > 0 => "v ",
                             _ => "",
                         };
-                        let hint = tree
-                            .and_then(|tree| tree.parent_hint.as_ref())
-                            .map_or(String::new(), |hint| format!(" ({hint})"));
+                        let hint = crate::open_elsewhere::caption(
+                            tree.and_then(|tree| tree.parent_hint.clone()),
+                            crate::open_elsewhere::holder(&thread.metadata, cx).as_ref(),
+                        )
+                        .map_or(String::new(), |caption| format!(" ({caption})"));
 
                         {
                             let live = if thread.is_live { " *" } else { "" };
@@ -16375,4 +16377,86 @@ async fn test_groups_without_child_threads_render_flat(cx: &mut TestAppContext) 
         vec!["v [my-project]", "  Second", "  First"]
     );
     assert!(sidebar.read_with(cx, |sidebar, _| sidebar.contents.thread_tree.is_empty()));
+}
+
+fn list_open_elsewhere(sessions: &[(&str, Option<&str>)], cx: &mut gpui::VisualTestContext) {
+    cx.update(|_window, cx| {
+        agent_ui::open_elsewhere_store::OpenElsewhereStore::try_global(cx)
+            .expect("open-elsewhere store")
+            .update(cx, |store, cx| {
+                store.apply_listing(
+                    &agent::ZED_AGENT_ID,
+                    sessions.iter().map(|(session, holder)| {
+                        (
+                            acp::SessionId::new(*session),
+                            holder.map(|holder| SharedString::from(holder.to_string())),
+                        )
+                    }),
+                    true,
+                    cx,
+                );
+            });
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn test_threads_open_in_other_apps_say_where(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    cx.update(|cx| {
+        agent_ui::thread_parent_store::ThreadParentStore::init_global(cx);
+        agent_ui::open_elsewhere_store::OpenElsewhereStore::init_global(cx);
+    });
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    save_minute_thread("coordinator", "Coordinator", 1, &project, cx);
+    save_minute_thread("desktop", "Busy in Codex Desktop", 2, &project, cx);
+    save_minute_thread("orphan", "Orphan in a terminal", 3, &project, cx);
+    set_thread_parent("orphan", "missing", cx);
+
+    // The marks show on the next render, without rebuilding the list.
+    let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+    cx.update(|_window, cx| {
+        let notifications = notifications.clone();
+        cx.observe(&sidebar, move |_, _| {
+            notifications.set(notifications.get() + 1)
+        })
+        .detach();
+    });
+    list_open_elsewhere(
+        &[
+            ("coordinator", None),
+            ("desktop", Some("Codex Desktop")),
+            ("orphan", Some("a terminal codex (pid 20796)")),
+        ],
+        cx,
+    );
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Orphan in a terminal (from an unknown thread • open in a terminal codex (pid 20796))",
+            "  Busy in Codex Desktop (open in Codex Desktop)",
+            "  Coordinator",
+        ]
+    );
+    assert!(notifications.get() > 0);
+
+    // The next listing doesn't mark them anymore.
+    notifications.set(0);
+    list_open_elsewhere(
+        &[("coordinator", None), ("desktop", None), ("orphan", None)],
+        cx,
+    );
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Orphan in a terminal (from an unknown thread)",
+            "  Busy in Codex Desktop",
+            "  Coordinator",
+        ]
+    );
+    assert!(notifications.get() > 0);
 }

@@ -24,6 +24,7 @@ mod mode_selector;
 mod model_search;
 mod model_selector;
 mod model_selector_popover;
+pub mod open_elsewhere_store;
 mod profile_selector;
 mod session_auto_import;
 mod terminal_codegen;
@@ -715,6 +716,7 @@ pub fn init(
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
     thread_parent_store::init(cx);
+    open_elsewhere_store::init(cx);
     session_auto_import::init(cx);
     terminal_thread_metadata_store::init(cx);
 

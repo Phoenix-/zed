@@ -1,3 +1,4 @@
+mod open_elsewhere;
 mod thread_switcher;
 mod thread_tree;
 
@@ -933,6 +934,7 @@ impl Sidebar {
             })
             .detach();
         }
+        Self::observe_open_elsewhere(cx);
 
         let channels_with_threads = channels_with_threads(cx);
         cx.spawn(async move |this, cx| {
@@ -2307,6 +2309,7 @@ impl Sidebar {
             }
             ListEntry::Thread(thread) => {
                 let row = self.render_thread(ix, thread, is_active, is_selected, cx);
+                let row = self.render_open_elsewhere_tooltip(ix, &thread.metadata, row, cx);
                 self.render_thread_tree_row(ix, thread.metadata.thread_id, row, cx)
             }
             ListEntry::Terminal(terminal) => {
@@ -6384,6 +6387,7 @@ impl Sidebar {
             || self
                 .regenerating_titles
                 .contains(&thread.metadata.thread_id);
+        let open_elsewhere = open_elsewhere::holder(&thread.metadata, cx);
 
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
@@ -6398,9 +6402,15 @@ impl Sidebar {
             })
             .worktrees(worktrees)
             .when_some(
-                self.thread_parent_hint(&thread.metadata.thread_id),
-                |this, hint| this.project_name(hint),
+                open_elsewhere::caption(
+                    self.thread_parent_hint(&thread.metadata.thread_id),
+                    open_elsewhere.as_ref(),
+                ),
+                |this, caption| this.project_name(caption),
             )
+            .when(open_elsewhere.is_some(), |this| {
+                this.title_label_color(Color::Muted)
+            })
             .timestamp(timestamp)
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
