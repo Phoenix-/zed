@@ -9422,6 +9422,46 @@ exit 7
         assert_eq!(interactivity(cx), SessionInteractivity::Full);
     }
 
+    #[gpui::test]
+    async fn test_configuration_can_arrive_after_a_session_opens(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let session_id = acp_v2::SessionId::new("configured-later");
+        let _thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    session_id.clone(),
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load session");
+        assert!(
+            cx.update(|cx| connection.session_config_options(&session_id, cx))
+                .is_none()
+        );
+
+        agent
+            .send_notification(acp::SessionNotification::new(
+                acp::SessionId::new(session_id.0.clone()),
+                acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(vec![
+                    acp::SessionConfigOption::boolean("fast", "Fast", true),
+                ])),
+            ))
+            .expect("send config option update");
+        cx.run_until_parked();
+        let options = cx
+            .update(|cx| connection.session_config_options(&session_id, cx))
+            .expect("configuration that arrives later is kept")
+            .config_options();
+        assert_eq!(options.len(), 1);
+    }
+
     #[gpui::test(iterations = 10)]
     async fn test_load_treats_replayed_subagent_state_as_history(cx: &mut gpui::TestAppContext) {
         let running = || acp::StateUpdate::Running(acp::RunningStateUpdate::new());
@@ -10493,6 +10533,14 @@ fn handle_session_notification(
             };
             *config_opts_cell.borrow_mut() = config_options;
             tx_cell.borrow_mut().send(()).ok();
+        } else if let Some(config_options) =
+            acp_thread::config_options::from_v1(config_options.clone()).log_err()
+            && let Some(session) = ctx.sessions.borrow_mut().get_mut(&session_id)
+        {
+            // A session may open without configuration and get it later, for example
+            // once its agent takes it over from another app.
+            session.config_options =
+                Some(ConfigOptions::new(Rc::new(RefCell::new(config_options))));
         }
     }
 

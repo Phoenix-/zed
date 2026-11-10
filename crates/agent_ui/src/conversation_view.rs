@@ -2325,6 +2325,7 @@ impl ConversationView {
             }
             AcpThreadEvent::ConfigOptionsUpdated(_) => {
                 // The watch task in ConfigOptionsView handles rebuilding selectors
+                self.show_config_options_received_late(&session_id, window, cx);
                 cx.notify();
             }
             AcpThreadEvent::WorkingDirectoriesUpdated => {
@@ -2343,6 +2344,43 @@ impl ConversationView {
             }
         }
         cx.notify();
+    }
+
+    /// A session may open without configuration and get it later, for example once
+    /// its agent takes it over from another app. Its thread view shows it then, in
+    /// place of the legacy selectors, as a view built at the start would.
+    fn show_config_options_received_late(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread_view) = self.thread_view(session_id) else {
+            return;
+        };
+        if thread_view.read(cx).config_options_view.is_some() {
+            return;
+        }
+        let thread = thread_view.read(cx).thread.clone();
+        let Some(config_options) = thread
+            .read(cx)
+            .connection()
+            .session_config_options(session_id, cx)
+        else {
+            return;
+        };
+        let agent_server = self.agent.clone();
+        let fs = self.project.read(cx).fs().clone();
+        let read_only = thread.read(cx).interactivity().is_read_only();
+        let config_options_view =
+            cx.new(|cx| ConfigOptionsView::new(config_options, agent_server, fs, window, cx));
+        config_options_view.update(cx, |view, cx| view.set_read_only(read_only, cx));
+        thread_view.update(cx, |thread_view, cx| {
+            thread_view.config_options_view = Some(config_options_view);
+            thread_view.mode_selector = None;
+            thread_view.model_selector = None;
+            cx.notify();
+        });
     }
 
     fn schedule_draft_prompt_persist(&mut self, cx: &mut Context<Self>) {
@@ -10405,6 +10443,128 @@ pub(crate) mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    /// An agent whose sessions open without configuration and get it later.
+    #[derive(Clone, Default)]
+    struct LateConfigConnection {
+        config_options: Arc<std::sync::Mutex<Option<Vec<acp_v2::SessionConfigOption>>>>,
+    }
+
+    impl AgentConnection for LateConfigConnection {
+        fn agent_id(&self) -> AgentId {
+            AgentId::new("late-config")
+        }
+
+        fn telemetry_id(&self) -> SharedString {
+            "late-config".into()
+        }
+
+        fn new_session(
+            self: Rc<Self>,
+            project: Entity<Project>,
+            _work_dirs: PathList,
+            cx: &mut gpui::App,
+        ) -> Task<gpui::Result<Entity<AcpThread>>> {
+            let thread = build_test_thread(
+                self,
+                project,
+                "LateConfigConnection",
+                acp_v2::SessionId::new("late-config-session"),
+                cx,
+            );
+            Task::ready(Ok(thread))
+        }
+
+        fn session_config_options(
+            &self,
+            _session_id: &acp_v2::SessionId,
+            _cx: &App,
+        ) -> Option<Rc<dyn acp_thread::AgentSessionConfigOptions>> {
+            let options = self.config_options.lock().ok()?.clone()?;
+            Some(Rc::new(FixedConfigOptions(options)))
+        }
+
+        fn auth_methods(&self) -> &[acp_v2::AuthMethod] {
+            &[]
+        }
+
+        fn authenticate(
+            &self,
+            _method_id: acp_v2::AuthMethodId,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn prompt(
+            &self,
+            _params: acp_v2::PromptRequest,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<acp_v1::PromptResponse>> {
+            Task::ready(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+        }
+
+        fn cancel(&self, _session_id: &acp_v2::SessionId, _cx: &mut App) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    struct FixedConfigOptions(Vec<acp_v2::SessionConfigOption>);
+
+    impl acp_thread::AgentSessionConfigOptions for FixedConfigOptions {
+        fn config_options(&self) -> Vec<acp_v2::SessionConfigOption> {
+            self.0.clone()
+        }
+
+        fn set_config_option(
+            &self,
+            _config_id: acp_v2::SessionConfigId,
+            _value: acp_v2::SessionConfigOptionValue,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<Vec<acp_v2::SessionConfigOption>>> {
+            Task::ready(Ok(self.0.clone()))
+        }
+    }
+
+    #[gpui::test]
+    async fn test_configuration_that_arrives_later_shows_up(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = LateConfigConnection::default();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        assert!(thread_view.read_with(cx, |view, _| view.config_options_view.is_none()));
+
+        // The session is still read-only when its configuration arrives.
+        thread.update(cx, |thread, cx| {
+            thread.set_interactivity(
+                acp_thread::interactivity::SessionInteractivity::ReadOnly { reason: None },
+                cx,
+            )
+        });
+        let options = vec![acp_v2::SessionConfigOption::boolean("fast", "Fast", true)];
+        *connection.config_options.lock().expect("config options") = Some(options.clone());
+        thread.update(cx, |_, cx| {
+            cx.emit(AcpThreadEvent::ConfigOptionsUpdated(options))
+        });
+        cx.run_until_parked();
+
+        let config_options_view = thread_view
+            .read_with(cx, |view, _| view.config_options_view.clone())
+            .expect("configuration that arrives later is shown");
+        assert!(config_options_view.read_with(cx, |view, _| view.is_read_only()));
+        thread.update(cx, |thread, cx| {
+            thread.set_interactivity(acp_thread::interactivity::SessionInteractivity::Full, cx)
+        });
+        cx.run_until_parked();
+        assert!(!config_options_view.read_with(cx, |view, _| view.is_read_only()));
     }
 
     #[derive(Clone, Copy)]
