@@ -21,7 +21,7 @@ use std::{
 
 use acp_thread::{
     AgentSessionInfo, AgentSessionInfoUpdate, AgentSessionList, AgentSessionListRequest,
-    SessionListUpdate,
+    SessionListUpdate, interactivity::interactivity_from_meta,
 };
 use agent::ThreadStore;
 use agent_client_protocol::schema::v2 as acp;
@@ -687,6 +687,21 @@ impl SessionAutoImport {
             && let Some(archived) = archived_from_meta(info.meta.as_ref())
         {
             self.apply_reported_archive(agent_id, session_list, &session_id, archived, cx);
+        }
+
+        // A session's interactivity, when the agent reports it, keeps the mark of
+        // another app holding the session in step with it: a writable session is
+        // free, and a read-only one is held by the app the agent names.
+        if let Some(interactivity) = interactivity_from_meta(info.meta.as_ref()) {
+            let holder = open_elsewhere_from_meta(info.meta.as_ref())
+                .filter(|_| interactivity.is_read_only());
+            if (holder.is_some() || !interactivity.is_read_only())
+                && let Some(store) = OpenElsewhereStore::try_global(cx)
+            {
+                store.update(cx, |store, cx| {
+                    store.set_holder(agent_id, session_id.clone(), holder, cx)
+                });
+            }
         }
 
         // An update that doesn't name a parent leaves the link alone: agents
@@ -1967,6 +1982,49 @@ mod tests {
         drop(list);
         cx.run_until_parked();
         assert_eq!(holder("free", cx), None);
+    }
+
+    #[gpui::test]
+    async fn test_interactivity_updates_keep_open_elsewhere_marks_in_step(cx: &mut TestAppContext) {
+        let auto_import = init_test(cx);
+        let list = FakeSessionList::new(true, vec![session("held", "Held", "/project", 1)]);
+        watch(&auto_import, &list, cx);
+        assert_eq!(holder("held", cx), None);
+        let send = |update: serde_json::Value, cx: &mut TestAppContext| {
+            list.send(SessionListUpdate::SessionInfo {
+                session_id: acp::SessionId::new("held"),
+                update: info_update(update),
+            });
+            cx.run_until_parked();
+        };
+
+        send(
+            serde_json::json!({"_meta": {
+                "gorynych/interactivity": "read-only",
+                "gorynych/openElsewhere": "Codex Desktop",
+            }}),
+            cx,
+        );
+        assert_eq!(holder("held", cx).as_deref(), Some("Codex Desktop"));
+
+        // Read-only without a holder, or a holder without interactivity, leaves the
+        // mark to the listings.
+        send(
+            serde_json::json!({"_meta": {"gorynych/interactivity": "read-only"}}),
+            cx,
+        );
+        send(
+            serde_json::json!({"title": "Renamed", "_meta": {"gorynych/openElsewhere": "VS Code"}}),
+            cx,
+        );
+        assert_eq!(holder("held", cx).as_deref(), Some("Codex Desktop"));
+
+        // A session that takes prompts again is free.
+        send(
+            serde_json::json!({"_meta": {"gorynych/interactivity": "full"}}),
+            cx,
+        );
+        assert_eq!(holder("held", cx), None);
     }
 
     fn is_archived(session_id: &str, cx: &TestAppContext) -> Option<bool> {

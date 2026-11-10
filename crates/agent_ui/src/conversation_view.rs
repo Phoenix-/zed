@@ -14556,6 +14556,79 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_read_only_thread_keeps_the_draft_until_it_takes_prompts(cx: &mut TestAppContext) {
+        use acp_thread::interactivity::SessionInteractivity;
+
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let message_editor = message_editor(&conversation_view, cx);
+        let draft =
+            |cx: &mut VisualTestContext| message_editor.read_with(cx, |editor, cx| editor.text(cx));
+        let entry_count =
+            |cx: &mut VisualTestContext| thread.read_with(cx, |thread, _| thread.entries().len());
+        // Each turn ends once the agent has answered.
+        let respond_to_next_prompt = || {
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new("Done".into()),
+            )]);
+        };
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("First prompt", window, cx);
+        });
+        respond_to_next_prompt();
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert!(thread_view.read_with(cx, |view, cx| view.can_edit_user_message(0, cx)));
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Draft for later", window, cx);
+        });
+        let entries = entry_count(cx);
+
+        let reason = "This Codex thread is open in Codex Desktop. Close it there to write here.";
+        thread.update(cx, |thread, cx| {
+            thread.set_interactivity(
+                SessionInteractivity::ReadOnly {
+                    reason: Some(reason.into()),
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, cx| {
+            assert!(view.is_read_only(cx));
+            assert!(!view.can_edit_user_message(0, cx));
+        });
+        // The composer gives way to the reason, and the draft can't be sent.
+        assert!(cx.debug_bounds("read-only-thread-notice").is_some());
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(entry_count(cx), entries);
+        assert_eq!(draft(cx), "Draft for later");
+
+        thread.update(cx, |thread, cx| {
+            thread.set_interactivity(SessionInteractivity::Full, cx)
+        });
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, cx| {
+            assert!(!view.is_read_only(cx));
+            assert!(view.can_edit_user_message(0, cx));
+        });
+        assert!(cx.debug_bounds("read-only-thread-notice").is_none());
+        assert_eq!(draft(cx), "Draft for later");
+        respond_to_next_prompt();
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert!(entry_count(cx) > entries);
+        assert_eq!(draft(cx), "");
+    }
+
+    #[gpui::test]
     async fn test_message_doesnt_send_if_empty(cx: &mut TestAppContext) {
         init_test(cx);
 

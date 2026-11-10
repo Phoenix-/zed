@@ -6,6 +6,7 @@ mod connection;
 pub mod content;
 mod diff;
 pub mod elicitation;
+pub mod interactivity;
 mod mention;
 pub mod notices;
 pub mod prompt_capabilities;
@@ -3601,6 +3602,8 @@ pub struct AcpThread {
     /// Set when this session is an ACP subagent announced by its parent.
     subagent_association: Option<subagents::SubagentAssociation>,
     provisional_title: Option<SharedString>,
+    /// Whether the user may write in this session, as its agent reports it.
+    interactivity: interactivity::SessionInteractivity,
     entries: Vec<AgentThreadEntry>,
     // Notices stay with the live session, but never enter conversation history or exports.
     notices: Vec<(usize, acp_v2::Notice)>,
@@ -3969,6 +3972,7 @@ impl AcpThread {
             plans: HashMap::default(),
             visible_plan: None,
             provisional_title: None,
+            interactivity: interactivity::SessionInteractivity::default(),
             project,
             running_turn: None,
             turn_id: 0,
@@ -4216,7 +4220,49 @@ impl AcpThread {
 
     /// Gates editing user messages and rewinding the thread to them.
     pub fn can_rewind_to(&self, client_id: Option<&ClientUserMessageId>, cx: &App) -> bool {
-        client_id.is_some() && self.parent_session_id.is_none() && self.supports_truncate(cx)
+        client_id.is_some()
+            && self.parent_session_id.is_none()
+            && !self.interactivity.is_read_only()
+            && self.supports_truncate(cx)
+    }
+
+    pub fn interactivity(&self) -> &interactivity::SessionInteractivity {
+        &self.interactivity
+    }
+
+    /// Sets whether the user may write in this session, as its agent reports it.
+    pub fn set_interactivity(
+        &mut self,
+        interactivity: interactivity::SessionInteractivity,
+        cx: &mut Context<Self>,
+    ) {
+        if self.interactivity == interactivity {
+            return;
+        }
+        self.interactivity = interactivity;
+        // Whether past prompts can be edited and sent again follows it.
+        let user_messages = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .map(|(ix, _)| ix)
+            .collect::<Vec<_>>();
+        for ix in user_messages {
+            cx.emit(AcpThreadEvent::EntryUpdated(ix));
+        }
+        cx.notify();
+    }
+
+    /// The agent refuses prompts to a read-only session, so they aren't sent.
+    fn read_only_error(&self) -> Option<anyhow::Error> {
+        let interactivity::SessionInteractivity::ReadOnly { reason } = &self.interactivity else {
+            return None;
+        };
+        Some(match reason {
+            Some(reason) => anyhow!("{reason}"),
+            None => anyhow!("This thread is read-only"),
+        })
     }
 
     pub fn work_dirs(&self) -> Option<&PathList> {
@@ -6986,6 +7032,9 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) -> Submission {
         let id = self.register_submission(message.clone().into(), cx);
+        if let Some(error) = self.read_only_error() {
+            return self.track_submission(id, None, cx, async move |_, _| Err(error));
+        }
         match self.submissions.transport().clone() {
             SubmissionTransport::Receipt(submissions) => {
                 let request = submissions.submit(message, cx);
@@ -7124,6 +7173,7 @@ impl AcpThread {
             SubmissionTransport::AgentOwned => false,
         };
         supports_retry
+            && !self.interactivity.is_read_only()
             && self
                 .submissions
                 .latest_id()
@@ -7139,6 +7189,9 @@ impl AcpThread {
             .map(|submission| submission.content.clone())
             .unwrap_or_default();
         let id = self.register_submission(content.clone(), cx);
+        if let Some(error) = self.read_only_error() {
+            return self.track_submission(id, None, cx, async move |_, _| Err(error));
+        }
         if let Err(error) = self.validate_prompt_content(&content) {
             return self.track_submission(id, None, cx, async move |_, _| Err(error));
         }
@@ -11420,6 +11473,103 @@ mod tests {
         } else {
             thread.append_message_chunk(kind, chunk, cx)
         }
+    }
+
+    #[gpui::test]
+    async fn test_read_only_sessions_take_no_prompts(cx: &mut TestAppContext) {
+        use interactivity::SessionInteractivity;
+
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection = Rc::new(StubAgentConnection::new().with_retry());
+        let thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .expect("session");
+        let respond_to_next_prompt = || {
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new("Done".into()),
+            )]);
+        };
+        respond_to_next_prompt();
+        thread
+            .update(cx, |thread, cx| thread.send(vec!["first".into()], cx))
+            .await
+            .expect("first prompt");
+        cx.run_until_parked();
+        let can_rewind = |thread: &AcpThread, cx: &App| {
+            let message = thread
+                .entries
+                .iter()
+                .find_map(|entry| entry.user_message())
+                .expect("user message");
+            thread.can_rewind_to(message.client_id.as_ref(), cx)
+        };
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.can_retry(cx));
+            assert!(can_rewind(thread, cx));
+        });
+        let entries = thread.read_with(cx, |thread, _| thread.entries.len());
+
+        let updated_entries = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let updated_entries = updated_entries.clone();
+            cx.subscribe(&thread, move |_, event, _| {
+                if let AcpThreadEvent::EntryUpdated(ix) = event {
+                    updated_entries.borrow_mut().push(*ix);
+                }
+            })
+            .detach();
+        });
+        let read_only = SessionInteractivity::ReadOnly {
+            reason: Some("Open in Codex Desktop.".into()),
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_interactivity(read_only.clone(), cx)
+        });
+        cx.run_until_parked();
+        // Past prompts can't be edited and sent again either.
+        assert_eq!(*updated_entries.borrow(), vec![0]);
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.interactivity(), &read_only);
+            assert!(!thread.can_retry(cx));
+            assert!(!can_rewind(thread, cx));
+        });
+
+        let error = thread
+            .update(cx, |thread, cx| thread.send(vec!["second".into()], cx))
+            .await
+            .expect_err("a read-only session takes no prompts");
+        assert_eq!(error.to_string(), "Open in Codex Desktop.");
+        thread
+            .update(cx, |thread, cx| thread.retry(cx))
+            .await
+            .expect_err("nor retries");
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.entries.len()),
+            entries
+        );
+
+        thread.update(cx, |thread, cx| {
+            thread.set_interactivity(SessionInteractivity::Full, cx)
+        });
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.can_retry(cx));
+            assert!(can_rewind(thread, cx));
+        });
+        respond_to_next_prompt();
+        thread
+            .update(cx, |thread, cx| thread.send(vec!["third".into()], cx))
+            .await
+            .expect("a writable session takes prompts again");
+        cx.run_until_parked();
+        assert!(thread.read_with(cx, |thread, _| thread.entries.len()) > entries);
     }
 
     #[gpui::test]

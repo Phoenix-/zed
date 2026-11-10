@@ -1056,8 +1056,15 @@ impl ThreadView {
         let session_id = thread.read(cx).session_id().clone();
         let parent_session_id = thread.read(cx).parent_session_id().cloned();
 
-        subscriptions.push(cx.observe(&thread, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe(&thread, |this, _, cx| {
+            this.sync_config_read_only(cx);
+            cx.notify();
+        }));
         subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
+        if let Some(config_options_view) = &config_options_view {
+            let read_only = thread.read(cx).interactivity().is_read_only();
+            config_options_view.update(cx, |view, cx| view.set_read_only(read_only, cx));
+        }
         subscriptions.push(cx.subscribe(&thread, |this, _, event, cx| {
             if matches!(
                 event,
@@ -1528,6 +1535,19 @@ impl ThreadView {
 
     fn is_subagent(&self) -> bool {
         self.parent_session_id.is_some()
+    }
+
+    /// Whether the user can't write in this thread: a subagent's thread belongs to
+    /// the agent, and an agent may open a session read-only.
+    pub(crate) fn is_read_only(&self, cx: &App) -> bool {
+        self.is_subagent() || self.thread.read(cx).interactivity().is_read_only()
+    }
+
+    fn sync_config_read_only(&self, cx: &mut Context<Self>) {
+        let read_only = self.thread.read(cx).interactivity().is_read_only();
+        if let Some(config_options_view) = &self.config_options_view {
+            config_options_view.update(cx, |view, cx| view.set_read_only(read_only, cx));
+        }
     }
 
     fn has_visible_conversation(&self, cx: &App) -> bool {
@@ -2111,6 +2131,10 @@ impl ThreadView {
     }
 
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The draft stays in the composer until the thread takes prompts again.
+        if self.is_read_only(cx) {
+            return;
+        }
         if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
             self.handle_thread_error(
                 anyhow!(
@@ -2984,6 +3008,7 @@ impl ThreadView {
     ) -> bool {
         if self.thread.read(cx).foreground_activity() != ForegroundActivity::Idle
             || self.is_loading_contents
+            || self.is_read_only(cx)
         {
             return false;
         }
@@ -3012,7 +3037,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.validate_queued_entry(id, cx) {
+        if self.is_read_only(cx) || !self.validate_queued_entry(id, cx) {
             return;
         }
         let is_generating = self.thread.read(cx).status() == acp_thread::ThreadStatus::Generating;
@@ -5356,21 +5381,68 @@ impl ThreadView {
         )
     }
 
+    /// Stands in for the composer of a thread the user can't write in, with the
+    /// configuration shown read-only. An agent that opened the session read-only
+    /// says why. A draft typed before stays in the composer for when the thread
+    /// takes prompts again.
+    fn render_read_only_composer(&self, cx: &Context<Self>) -> AnyElement {
+        let interactivity = self.thread.read(cx).interactivity();
+        let notice = (!self.is_subagent() && interactivity.is_read_only()).then(|| {
+            let reason = interactivity
+                .read_only_reason()
+                .cloned()
+                .unwrap_or_else(|| "This thread is read-only.".into());
+            let keeps_draft = !self.message_editor.read(cx).is_empty(cx);
+            h_flex()
+                .debug_selector(|| "read-only-thread-notice".into())
+                .w_full()
+                .items_start()
+                .gap_1p5()
+                .child(
+                    Icon::new(IconName::Lock)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            Label::new(reason)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .when(keeps_draft, |this| {
+                            this.child(
+                                Label::new("Your draft is kept.")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        }),
+                )
+        });
+        v_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .children(notice)
+            .child(
+                h_flex().children(
+                    self.config_options_view
+                        .clone()
+                        .filter(|view| view.read(cx).is_read_only()),
+                ),
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn render_message_editor(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if self.is_subagent() {
-            return h_flex()
-                .px_2()
-                .py_1()
-                .children(
-                    self.config_options_view
-                        .clone()
-                        .filter(|view| view.read(cx).is_read_only()),
-                )
-                .into_any_element();
+        if self.is_read_only(cx) {
+            return self.render_read_only_composer(cx);
         }
 
         let focus_handle = self.message_editor.focus_handle(cx);

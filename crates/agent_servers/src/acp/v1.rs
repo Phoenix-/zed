@@ -44,6 +44,7 @@ use util::path_list::PathList;
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
 
+use acp_thread::interactivity::{SessionInteractivity, interactivity_from_meta};
 use acp_thread::{AcpThread, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
@@ -178,9 +179,13 @@ struct PendingAcpSession {
     task: Shared<Task<Result<(), Arc<anyhow::Error>>>>,
 }
 
+#[derive(Default)]
 struct SessionConfigResponse {
     modes: Option<acp::SessionModeState>,
     config_options: Option<Vec<acp::SessionConfigOption>>,
+    /// Whether the opened session takes prompts. A response that doesn't say opens
+    /// it writable.
+    interactivity: SessionInteractivity,
 }
 
 /// Sends `request` and returns its response. Once the response arrives, the agent's later
@@ -1067,6 +1072,10 @@ impl AcpConnection {
                     let Some(connection_state) = this.upgrade() else {
                         return Ok(());
                     };
+                    let interactivity = response
+                        .as_ref()
+                        .map(|response| response.interactivity.clone())
+                        .unwrap_or_default();
                     let (modes, config_options) = match response
                         .and_then(|response| config_state(response.modes, response.config_options))
                     {
@@ -1095,6 +1104,8 @@ impl AcpConnection {
                             session.session_modes = modes;
                             session.config_options = config_options;
                         }
+                        loaded_thread
+                            .update(cx, |thread, cx| thread.set_interactivity(interactivity, cx));
                         if replays_history {
                             loaded_thread.update(cx, |thread, cx| {
                                 thread.invalidate_replayed_subagent_state(cx)
@@ -1560,6 +1571,8 @@ impl AgentConnection for AcpConnection {
                     Ok(SessionConfigResponse {
                         modes: response.modes,
                         config_options: response.config_options,
+                        interactivity: interactivity_from_meta(response.meta.as_ref())
+                            .unwrap_or_default(),
                     })
                 })
             },
@@ -1604,6 +1617,8 @@ impl AgentConnection for AcpConnection {
                     Ok(SessionConfigResponse {
                         modes: response.modes,
                         config_options: response.config_options,
+                        interactivity: interactivity_from_meta(response.meta.as_ref())
+                            .unwrap_or_default(),
                     })
                 })
             },
@@ -6465,6 +6480,7 @@ mod tests {
                                 Ok(SessionConfigResponse {
                                     modes: None,
                                     config_options: Some(returned),
+                                    ..Default::default()
                                 })
                             }
                             .boxed_local()
@@ -6816,6 +6832,7 @@ mod tests {
                             Ok(SessionConfigResponse {
                                 modes: None,
                                 config_options: Some(initial_options),
+                                ..Default::default()
                             })
                         }
                         .boxed_local()
@@ -6865,6 +6882,7 @@ mod tests {
                             Ok(SessionConfigResponse {
                                 modes: None,
                                 config_options: Some(replacement_options),
+                                ..Default::default()
                             })
                         }
                         .boxed_local()
@@ -9302,6 +9320,108 @@ exit 7
         );
     }
 
+    #[gpui::test]
+    async fn test_opening_a_read_only_session_marks_its_thread(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({"a": {}})).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let (connection, _requests) = connect_config_defaults_test_agent(cx).await;
+        let connection = Rc::new(connection);
+        let read_only = SessionInteractivity::ReadOnly {
+            reason: Some("Open in Codex Desktop.".into()),
+        };
+        let thread = cx
+            .update(|cx| {
+                connection.clone().open_or_create_session(
+                    acp_v2::SessionId::new("held-elsewhere"),
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    true,
+                    {
+                        let read_only = read_only.clone();
+                        |_, _, _, _| {
+                            async move {
+                                Ok(SessionConfigResponse {
+                                    interactivity: read_only,
+                                    ..Default::default()
+                                })
+                            }
+                            .boxed_local()
+                        }
+                    },
+                    cx,
+                )
+            })
+            .await
+            .expect("open a read-only session");
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.interactivity(), &read_only);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_session_info_updates_change_interactivity(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let session_id = acp_v2::SessionId::new("held-elsewhere");
+        let thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    session_id.clone(),
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load session");
+        let interactivity = |cx: &mut gpui::TestAppContext| {
+            thread.read_with(cx, |thread, _| thread.interactivity().clone())
+        };
+        // A load response that doesn't say opens the session writable.
+        assert_eq!(interactivity(cx), SessionInteractivity::Full);
+
+        let notify = |update: acp::SessionInfoUpdate| {
+            agent
+                .send_notification(acp::SessionNotification::new(
+                    acp::SessionId::new(session_id.0.clone()),
+                    acp::SessionUpdate::SessionInfoUpdate(update),
+                ))
+                .expect("send session info update");
+        };
+        let meta = |value: serde_json::Value| -> acp::Meta {
+            serde_json::from_value(value).expect("meta")
+        };
+        notify(acp::SessionInfoUpdate::new().meta(meta(serde_json::json!({
+            "gorynych/interactivity": "read-only",
+            "gorynych/interactivityReason": "Open in Codex Desktop.",
+        }))));
+        cx.run_until_parked();
+        let read_only = SessionInteractivity::ReadOnly {
+            reason: Some("Open in Codex Desktop.".into()),
+        };
+        assert_eq!(interactivity(cx), read_only);
+
+        // An update that doesn't report it leaves it as it was.
+        notify(acp::SessionInfoUpdate::new().title("Renamed"));
+        cx.run_until_parked();
+        assert_eq!(interactivity(cx), read_only);
+
+        notify(acp::SessionInfoUpdate::new().meta(meta(serde_json::json!({
+            "gorynych/interactivity": "full",
+        }))));
+        cx.run_until_parked();
+        assert_eq!(interactivity(cx), SessionInteractivity::Full);
+    }
+
     #[gpui::test(iterations = 10)]
     async fn test_load_treats_replayed_subagent_state_as_history(cx: &mut gpui::TestAppContext) {
         let running = || acp::StateUpdate::Running(acp::RunningStateUpdate::new());
@@ -9441,6 +9561,7 @@ exit 7
                                         "Web Search",
                                         false,
                                     )]),
+                                    ..Default::default()
                                 })
                             }
                             .boxed_local()
@@ -10385,6 +10506,12 @@ fn handle_session_notification(
     let Some(strong_thread) = thread.upgrade() else {
         return;
     };
+
+    if let acp::SessionUpdate::SessionInfoUpdate(info_update) = &notification.update
+        && let Some(interactivity) = interactivity_from_meta(info_update.meta.as_ref())
+    {
+        strong_thread.update(cx, |thread, cx| thread.set_interactivity(interactivity, cx));
+    }
 
     if matches!(
         notification.update,

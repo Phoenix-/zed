@@ -5,7 +5,8 @@
 //! Such an agent names that app in the `_meta` of the session's info in its
 //! session list, so that the sidebar can say so before the user clicks the
 //! thread. The marks live only in memory: each listing reports them afresh, and a
-//! listed session without the key is free.
+//! listed session without the key is free. A session info update that reports the
+//! session's interactivity updates its mark as well.
 
 use agent_client_protocol::schema::v2 as acp;
 use collections::{HashMap, HashSet};
@@ -84,6 +85,17 @@ impl OpenElsewhereStore {
         if changed {
             cx.notify();
         }
+    }
+
+    /// Records the holder an agent reported for one session outside a listing.
+    pub fn set_holder(
+        &mut self,
+        agent_id: &AgentId,
+        session_id: acp::SessionId,
+        holder: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_listing(agent_id, [(session_id, holder)], false, cx);
     }
 
     /// Forgets the marks of an agent Zed no longer hears from: without it, they

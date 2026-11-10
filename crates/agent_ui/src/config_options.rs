@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Arc};
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use acp_thread::AgentSessionConfigOptions;
 use agent_client_protocol::schema::v2 as acp;
@@ -32,6 +32,8 @@ const PICKER_THRESHOLD: usize = 5;
 
 pub struct ConfigOptionsView {
     config_options: Rc<dyn AgentSessionConfigOptions>,
+    /// Set while the thread doesn't take prompts, on top of what the agent allows.
+    read_only: Rc<Cell<bool>>,
     selectors: Vec<Entity<ConfigOptionSelector>>,
     agent_server: Rc<dyn AgentServer>,
     fs: Arc<dyn Fs>,
@@ -47,6 +49,11 @@ impl ConfigOptionsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let read_only = Rc::new(Cell::new(false));
+        let config_options: Rc<dyn AgentSessionConfigOptions> = Rc::new(ReadOnlyWhileSet {
+            config_options,
+            read_only: read_only.clone(),
+        });
         let selectors = Self::build_selectors(&config_options, &agent_server, &fs, window, cx);
         let config_option_ids = Self::config_option_ids(&config_options);
 
@@ -65,6 +72,7 @@ impl ConfigOptionsView {
 
         Self {
             config_options,
+            read_only,
             selectors,
             agent_server,
             fs,
@@ -75,6 +83,17 @@ impl ConfigOptionsView {
 
     pub fn is_read_only(&self) -> bool {
         self.config_options.is_read_only()
+    }
+
+    /// Keeps the configuration from being changed while the thread is read-only.
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        if self.read_only.replace(read_only) == read_only {
+            return;
+        }
+        for selector in &self.selectors {
+            selector.update(cx, |_, cx| cx.notify());
+        }
+        cx.notify();
     }
 
     pub fn toggle_category_picker(
@@ -287,6 +306,38 @@ impl Render for ConfigOptionsView {
             .gap_1()
             .children(self.selectors.iter().cloned())
             .into_any_element()
+    }
+}
+
+/// A session's configuration that can't be changed while a flag is set.
+struct ReadOnlyWhileSet {
+    config_options: Rc<dyn AgentSessionConfigOptions>,
+    read_only: Rc<Cell<bool>>,
+}
+
+impl AgentSessionConfigOptions for ReadOnlyWhileSet {
+    fn config_options(&self) -> Vec<acp::SessionConfigOption> {
+        self.config_options.config_options()
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only.get() || self.config_options.is_read_only()
+    }
+
+    fn set_config_option(
+        &self,
+        config_id: acp::SessionConfigId,
+        value: acp::SessionConfigOptionValue,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Vec<acp::SessionConfigOption>>> {
+        if self.read_only.get() {
+            return Task::ready(Err(anyhow::anyhow!("Session configuration is read-only")));
+        }
+        self.config_options.set_config_option(config_id, value, cx)
+    }
+
+    fn watch(&self, cx: &mut App) -> Option<watch::Receiver<()>> {
+        self.config_options.watch(cx)
     }
 }
 
@@ -1308,6 +1359,7 @@ mod tests {
                 cx.new(|_| ConfigOptionsView {
                     config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
                     config_options,
+                    read_only: Default::default(),
                     selectors: Vec::new(),
                     agent_server,
                     fs,
@@ -1401,6 +1453,7 @@ mod tests {
             let view = cx.new(|_| ConfigOptionsView {
                 config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
                 config_options,
+                read_only: Default::default(),
                 selectors: Vec::new(),
                 agent_server,
                 fs,
@@ -1445,6 +1498,7 @@ mod tests {
             let view = cx.new(|_| ConfigOptionsView {
                 config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
                 config_options,
+                read_only: Default::default(),
                 selectors: Vec::new(),
                 agent_server,
                 fs,
@@ -1499,6 +1553,7 @@ mod tests {
             let view = cx.new(|_| ConfigOptionsView {
                 config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
                 config_options,
+                read_only: Default::default(),
                 selectors: Vec::new(),
                 agent_server,
                 fs,
@@ -1648,6 +1703,83 @@ mod tests {
                 Some(AgentConfigOptionValue::ValueId("manual".to_string()))
             )]
         );
+    }
+
+    #[gpui::test]
+    async fn config_options_are_read_only_while_their_thread_is(cx: &mut TestAppContext) {
+        let agent_server = Rc::new(TestAgentServer::default());
+        let config_options = Rc::new(TestSessionConfigOptions::new(vec![
+            acp::SessionConfigOption::select(
+                "model",
+                "Model",
+                "fast",
+                vec![
+                    acp::SessionConfigSelectOption::new("fast", "Fast model"),
+                    acp::SessionConfigSelectOption::new("smart", "Smart model"),
+                ],
+            )
+            .category(acp::SessionConfigOptionCategory::Model),
+        ]));
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+        let cx = cx.add_empty_window();
+        let view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConfigOptionsView::new(
+                    config_options.clone(),
+                    agent_server.clone(),
+                    fs.clone(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(!view.is_read_only());
+                view.set_read_only(true, cx);
+                assert!(view.is_read_only());
+                assert!(!view.toggle_category_picker(
+                    acp::SessionConfigOptionCategory::Model,
+                    window,
+                    cx,
+                ));
+                assert!(!view.cycle_category_option(
+                    acp::SessionConfigOptionCategory::Model,
+                    false,
+                    cx,
+                ));
+            });
+        });
+        let gated = view.read_with(cx, |view, _| view.config_options.clone());
+        let error = cx
+            .update(|_, cx| {
+                set_config_option_and_default(
+                    gated,
+                    agent_server.clone(),
+                    "model".into(),
+                    acp::SessionConfigOptionValue::id("smart"),
+                    fs.clone(),
+                    cx,
+                )
+            })
+            .await
+            .expect_err("a read-only thread's configuration cannot change");
+        assert!(error.to_string().contains("read-only"));
+        assert!(config_options.set_values.borrow().is_empty());
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.set_read_only(false, cx);
+                assert!(!view.is_read_only());
+                assert!(view.cycle_category_option(
+                    acp::SessionConfigOptionCategory::Model,
+                    false,
+                    cx,
+                ));
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(config_options.set_values.borrow().len(), 1);
     }
 
     #[gpui::test]
