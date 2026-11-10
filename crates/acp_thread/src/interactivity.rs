@@ -4,10 +4,11 @@
 //! thread that another app holds open. Such a thread keeps its history and stays
 //! live, but takes no prompts until the agent reports that it is writable again.
 //!
-//! ACP has no field for this yet. Until it does, agents report it in the `_meta` of
-//! the `session/load` and `session/resume` responses, of `session_info_update`
-//! notifications and of `session/list` items, and [`interactivity_from_meta`] is the
-//! one place that reads it. A standard field would replace that function alone.
+//! ACP has no field for this yet. Until it does, agents report it in `_meta`, and
+//! [`interactivity_from_meta`] is the one place that reads it. A thread takes it
+//! from the `session/load` and `session/resume` responses and from
+//! `session_info_update` notifications; the latter also keep the session list's
+//! marks in step. A standard field would replace that function alone.
 
 use agent_client_protocol::schema::v2 as acp;
 use gpui::SharedString;

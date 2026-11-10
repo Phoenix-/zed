@@ -14589,6 +14589,8 @@ pub(crate) mod tests {
             editor.set_text("Draft for later", window, cx);
         });
         let entries = entry_count(cx);
+        // The user was editing the first prompt again.
+        thread_view.update(cx, |view, _| view.editing_message = Some(0));
 
         let reason = "This Codex thread is open in Codex Desktop. Close it there to write here.";
         thread.update(cx, |thread, cx| {
@@ -14603,6 +14605,7 @@ pub(crate) mod tests {
         thread_view.read_with(cx, |view, cx| {
             assert!(view.is_read_only(cx));
             assert!(!view.can_edit_user_message(0, cx));
+            assert_eq!(view.editing_message, None);
         });
         // The composer gives way to the reason, and the draft can't be sent.
         assert!(cx.debug_bounds("read-only-thread-notice").is_some());
@@ -14626,6 +14629,201 @@ pub(crate) mod tests {
         cx.run_until_parked();
         assert!(entry_count(cx) > entries);
         assert_eq!(draft(cx), "");
+    }
+
+    /// A conversation with a stub agent whose answers the test controls, ready to
+    /// make the thread read-only or writable.
+    async fn read_only_test_conversation(
+        cx: &mut TestAppContext,
+    ) -> (
+        StubAgentConnection,
+        Entity<ThreadView>,
+        Entity<AcpThread>,
+        Entity<MessageEditor>,
+        &mut VisualTestContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let message_editor = message_editor(&conversation_view, cx);
+        (connection, thread_view, thread, message_editor, cx)
+    }
+
+    fn set_read_only(thread: &Entity<AcpThread>, read_only: bool, cx: &mut VisualTestContext) {
+        use acp_thread::interactivity::SessionInteractivity;
+        thread.update(cx, |thread, cx| {
+            thread.set_interactivity(
+                if read_only {
+                    SessionInteractivity::ReadOnly { reason: None }
+                } else {
+                    SessionInteractivity::Full
+                },
+                cx,
+            )
+        });
+    }
+
+    fn respond_to_next_prompt(connection: &StubAgentConnection) {
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+            acp_v1::ContentChunk::new("Done".into()),
+        )]);
+    }
+
+    #[gpui::test]
+    async fn test_interrupting_a_read_only_thread_keeps_its_turn_and_draft(
+        cx: &mut TestAppContext,
+    ) {
+        let (connection, thread_view, thread, message_editor, cx) =
+            read_only_test_conversation(cx).await;
+        let finish_turn = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Running turn", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating
+        );
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Steer now", window, cx);
+        });
+        let entries = thread.read_with(cx, |thread, _| thread.entries().len());
+
+        set_read_only(&thread, true, cx);
+        cx.run_until_parked();
+        thread_view.update_in(cx, |view, window, cx| view.interrupt_and_send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating,
+            "the running turn must not be cancelled for a message that can't be sent"
+        );
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.entries().len()),
+            entries
+        );
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "Steer now"
+        );
+        finish_turn
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .ok();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_queued_messages_go_out_once_the_thread_takes_prompts(cx: &mut TestAppContext) {
+        let (connection, thread_view, thread, message_editor, cx) =
+            read_only_test_conversation(cx).await;
+        let finish_turn = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Running turn", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Queued follow-up", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            thread_view.read_with(cx, |view, _| view.message_queue.len()),
+            1
+        );
+
+        // The turn ends while the thread is read-only: the message waits.
+        set_read_only(&thread, true, cx);
+        finish_turn
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .ok();
+        cx.run_until_parked();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle
+        );
+        assert_eq!(
+            thread_view.read_with(cx, |view, _| view.message_queue.len()),
+            1
+        );
+        let entries = thread.read_with(cx, |thread, _| thread.entries().len());
+
+        respond_to_next_prompt(&connection);
+        set_read_only(&thread, false, cx);
+        cx.run_until_parked();
+        assert_eq!(
+            thread_view.read_with(cx, |view, _| view.message_queue.len()),
+            0
+        );
+        assert!(thread.read_with(cx, |thread, _| thread.entries().len()) > entries);
+    }
+
+    #[gpui::test]
+    async fn test_messages_caught_by_a_read_only_switch_go_back(cx: &mut TestAppContext) {
+        let (connection, thread_view, thread, message_editor, cx) =
+            read_only_test_conversation(cx).await;
+        let entries = thread.read_with(cx, |thread, _| thread.entries().len());
+
+        // A message from the composer, prepared while the thread turns read-only,
+        // goes back to the composer.
+        let (contents_ready, contents) = futures::channel::oneshot::channel::<()>();
+        thread_view.update_in(cx, |view, window, cx| {
+            let contents = cx.spawn(async move |_, _| {
+                contents.await?;
+                anyhow::Ok(Some((vec!["Prepared message".into()], Vec::new())))
+            });
+            view.send_content(contents, false, window, cx);
+        });
+        set_read_only(&thread, true, cx);
+        contents_ready.send(()).ok();
+        cx.run_until_parked();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.entries().len()),
+            entries
+        );
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "Prepared message"
+        );
+
+        // A queued message taken out just before the switch goes back to the queue.
+        set_read_only(&thread, false, cx);
+        message_editor.update_in(cx, |editor, window, cx| editor.set_text("", window, cx));
+        thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["Queued message".into()], Vec::new(), window, cx);
+            let id = view.message_queue.first_id().expect("queued message");
+            view.send_queued_message_now(id, window, cx);
+            view.thread.clone().update(cx, |thread, cx| {
+                thread.set_interactivity(
+                    acp_thread::interactivity::SessionInteractivity::ReadOnly { reason: None },
+                    cx,
+                )
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            thread_view.read_with(cx, |view, _| view.message_queue.len()),
+            1
+        );
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.entries().len()),
+            entries
+        );
+
+        // It goes out once the thread takes prompts again.
+        respond_to_next_prompt(&connection);
+        set_read_only(&thread, false, cx);
+        cx.run_until_parked();
+        assert_eq!(
+            thread_view.read_with(cx, |view, _| view.message_queue.len()),
+            0
+        );
+        assert!(thread.read_with(cx, |thread, _| thread.entries().len()) > entries);
     }
 
     #[gpui::test]

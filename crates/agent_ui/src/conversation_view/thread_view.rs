@@ -755,6 +755,14 @@ impl PermissionSelection {
     }
 }
 
+/// Where a message goes back to when its thread turns read-only before it is sent.
+enum ReturnUnsentTo {
+    /// The composer, which sending cleared.
+    Composer,
+    /// Its place in the queue it was taken from.
+    Queue { id: QueueEntryId, steer: bool },
+}
+
 pub struct ThreadView {
     pub(crate) root_thread_id: ThreadId,
     pub session_id: acp_v2::SessionId,
@@ -798,6 +806,8 @@ pub struct ThreadView {
     pub editor_expanded: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
+    /// Whether the thread was read-only when this view last looked.
+    thread_read_only: bool,
     pub message_queue: MessageQueue,
     pub turn_fields: TurnFields,
     pub discarded_partial_edits: HashSet<acp_v2::ToolCallId>,
@@ -1056,14 +1066,14 @@ impl ThreadView {
         let session_id = thread.read(cx).session_id().clone();
         let parent_session_id = thread.read(cx).parent_session_id().cloned();
 
-        subscriptions.push(cx.observe(&thread, |this, _, cx| {
-            this.sync_config_read_only(cx);
+        subscriptions.push(cx.observe_in(&thread, window, |this, _, window, cx| {
+            this.sync_interactivity(window, cx);
             cx.notify();
         }));
         subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
+        let thread_read_only = thread.read(cx).interactivity().is_read_only();
         if let Some(config_options_view) = &config_options_view {
-            let read_only = thread.read(cx).interactivity().is_read_only();
-            config_options_view.update(cx, |view, cx| view.set_read_only(read_only, cx));
+            config_options_view.update(cx, |view, cx| view.set_read_only(thread_read_only, cx));
         }
         subscriptions.push(cx.subscribe(&thread, |this, _, event, cx| {
             if matches!(
@@ -1293,6 +1303,7 @@ impl ThreadView {
             title_editor,
             title_editor_sync_version,
             config_options_view,
+            thread_read_only,
             mode_selector,
             model_selector,
             profile_selector,
@@ -1543,11 +1554,56 @@ impl ThreadView {
         self.is_subagent() || self.thread.read(cx).interactivity().is_read_only()
     }
 
-    fn sync_config_read_only(&self, cx: &mut Context<Self>) {
+    /// Follows the thread's interactivity. While the thread is read-only, its
+    /// configuration can't change and none of its past prompts is being edited;
+    /// once it takes prompts again, what was queued meanwhile goes out.
+    fn sync_interactivity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let read_only = self.thread.read(cx).interactivity().is_read_only();
+        if read_only == self.thread_read_only {
+            return;
+        }
+        self.thread_read_only = read_only;
         if let Some(config_options_view) = &self.config_options_view {
             config_options_view.update(cx, |view, cx| view.set_read_only(read_only, cx));
         }
+        if read_only {
+            self.editing_message = None;
+        } else {
+            let is_first_editor_focused = self
+                .message_queue
+                .first()
+                .is_some_and(|entry| entry.editor.focus_handle(cx).is_focused(window));
+            self.send_queued_message_after_generation_stopped(is_first_editor_focused, window, cx);
+        }
+    }
+
+    /// Puts back a message that was about to be sent when its thread turned
+    /// read-only, so that it goes out once the thread takes prompts again.
+    fn return_unsent_message(
+        &mut self,
+        return_to: ReturnUnsentTo,
+        content: Vec<acp_v2::ContentBlock>,
+        tracked_buffers: Vec<Entity<Buffer>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match return_to {
+            ReturnUnsentTo::Composer if self.message_editor.read(cx).is_empty(cx) => {
+                self.message_editor.update(cx, |editor, cx| {
+                    editor.set_message(content, window, cx);
+                });
+            }
+            // Text typed since stays in the composer.
+            ReturnUnsentTo::Composer => self.add_to_queue(content, tracked_buffers, window, cx),
+            ReturnUnsentTo::Queue { id, steer } => {
+                let entry = self.new_queue_entry(id, content, tracked_buffers, steer, window, cx);
+                self.message_queue.restore_after_failed_send(entry);
+                // It waits for the thread rather than for the user.
+                self.message_queue.resume();
+                self.sync_queue_flag_to_native_thread(cx);
+            }
+        }
+        cx.notify();
     }
 
     fn has_visible_conversation(&self, cx: &App) -> bool {
@@ -2339,6 +2395,25 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.send_content_returning_unsent(
+            contents_task,
+            is_native_command,
+            ReturnUnsentTo::Composer,
+            window,
+            cx,
+        );
+    }
+
+    fn send_content_returning_unsent(
+        &mut self,
+        contents_task: Task<
+            anyhow::Result<Option<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>>,
+        >,
+        is_native_command: bool,
+        return_to: ReturnUnsentTo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let session_id = self.thread.read(cx).session_id().clone();
         let parent_session_id = self.thread.read(cx).parent_session_id().cloned();
         let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
@@ -2362,6 +2437,14 @@ impl ThreadView {
             let Some((contents, tracked_buffers)) = contents_task.await? else {
                 return Ok(());
             };
+            // The thread may have turned read-only while the message was prepared.
+            // Nothing below yields before the message is sent.
+            if thread.read_with(cx, |thread, _| thread.interactivity().is_read_only())? {
+                this.update_in(cx, |this, window, cx| {
+                    this.return_unsent_message(return_to, contents, tracked_buffers, window, cx)
+                })?;
+                return Ok(());
+            }
 
             let uses_reported_activity =
                 thread.read_with(cx, |thread, _| thread.uses_reported_activity())?;
@@ -2500,6 +2583,10 @@ impl ThreadView {
     }
 
     pub fn interrupt_and_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Interrupting would cancel the running turn for a message that can't be sent.
+        if self.is_read_only(cx) {
+            return;
+        }
         if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
             self.handle_thread_error(
                 anyhow!(
@@ -2776,6 +2863,9 @@ impl ThreadView {
                 });
             }
 
+            if thread.read_with(cx, |thread, _| thread.interactivity().is_read_only()) {
+                return anyhow::Ok(());
+            }
             thread
                 .update(cx, |thread, cx| thread.rewind(client_id, cx))
                 .await?;
@@ -2845,7 +2935,21 @@ impl ThreadView {
         // The ID must be allocated up front so the editor event subscription
         // can capture it before the entry (which owns the subscription) exists.
         let id = self.message_queue.next_id();
+        let entry = self.new_queue_entry(id, content, tracked_buffers, false, window, cx);
+        self.message_queue.enqueue(entry);
+        self.sync_queue_flag_to_native_thread(cx);
+        cx.notify();
+    }
 
+    fn new_queue_entry(
+        &mut self,
+        id: QueueEntryId,
+        content: Vec<acp_v2::ContentBlock>,
+        tracked_buffers: Vec<Entity<Buffer>>,
+        steer: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> QueueEntry {
         let editor = cx.new(|cx| {
             let mut editor = MessageEditor::new(
                 self.workspace.clone(),
@@ -2871,16 +2975,14 @@ impl ThreadView {
                 this.handle_queue_editor_event(id, event, window, cx);
             });
 
-        self.message_queue.enqueue(QueueEntry {
+        QueueEntry {
             id,
             content,
             tracked_buffers,
-            steer: false,
+            steer,
             editor,
             _subscription: subscription,
-        });
-        self.sync_queue_flag_to_native_thread(cx);
-        cx.notify();
+        }
     }
 
     fn handle_queue_editor_event(
@@ -3080,6 +3182,7 @@ impl ThreadView {
         let cancelled = self.thread.update(cx, |thread, cx| thread.cancel(cx));
 
         let workspace = self.workspace.clone();
+        let (entry_id, entry_steer) = (entry.id, entry.steer);
 
         let should_be_following = self.should_be_following;
         let contents_task = cx.spawn_in(window, async move |this, cx| {
@@ -3103,7 +3206,16 @@ impl ThreadView {
             Ok(Some((entry.content, entry.tracked_buffers)))
         });
 
-        self.send_content(contents_task, is_native_command, window, cx);
+        self.send_content_returning_unsent(
+            contents_task,
+            is_native_command,
+            ReturnUnsentTo::Queue {
+                id: entry_id,
+                steer: entry_steer,
+            },
+            window,
+            cx,
+        );
     }
 
     pub fn move_queued_message_to_main_editor(

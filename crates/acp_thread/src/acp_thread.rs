@@ -7064,6 +7064,9 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) -> Submission {
         let id = self.register_submission(content.into(), cx);
+        if let Some(error) = self.read_only_error() {
+            return self.track_submission(id, None, cx, async move |_, _| Err(error));
+        }
         self.track_receipt_submission(id, request.into(), cx)
     }
 
@@ -7613,6 +7616,10 @@ impl AcpThread {
         client_id: ClientUserMessageId,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        // A rewound prompt is sent again, which a read-only session refuses.
+        if let Some(error) = self.read_only_error() {
+            return Task::ready(Err(error));
+        }
         let Some(truncate) = self.connection.truncate(self.session_id(), cx) else {
             return Task::ready(Err(anyhow!("not supported")));
         };
@@ -11551,6 +11558,27 @@ mod tests {
             .update(cx, |thread, cx| thread.retry(cx))
             .await
             .expect_err("nor retries");
+        let client_id = thread.read_with(cx, |thread, _| {
+            thread
+                .entries
+                .iter()
+                .find_map(|entry| entry.user_message()?.client_id.clone())
+                .expect("client id")
+        });
+        thread
+            .update(cx, |thread, cx| thread.rewind(client_id, cx))
+            .await
+            .expect_err("nor rewinds, which send the prompt again");
+        thread
+            .update(cx, |thread, cx| {
+                thread.submit_receipt(
+                    vec!["receipt".into()],
+                    Task::ready(Ok(acp_v2::PromptResponse::new("receipt"))),
+                    cx,
+                )
+            })
+            .await
+            .expect_err("nor receipt submissions");
         assert_eq!(
             thread.read_with(cx, |thread, _| thread.entries.len()),
             entries
