@@ -16385,7 +16385,9 @@ fn list_open_elsewhere(sessions: &[(&str, Option<&str>)], cx: &mut gpui::VisualT
             .expect("open-elsewhere store")
             .update(cx, |store, cx| {
                 store.apply_listing(
-                    &agent::ZED_AGENT_ID,
+                    &agent_ui::session_auto_import::SessionSource::local(
+                        agent::ZED_AGENT_ID.clone(),
+                    ),
                     sessions.iter().map(|(session, holder)| {
                         (
                             acp::SessionId::new(*session),
@@ -16459,4 +16461,129 @@ async fn test_threads_open_in_other_apps_say_where(cx: &mut TestAppContext) {
         ]
     );
     assert!(notifications.get() > 0);
+}
+
+#[gpui::test]
+async fn test_remote_projects_import_the_remote_machines_agents(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+    server_cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+    let app_state = cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        <dyn fs::Fs>::set_global(app_state.fs.clone(), cx);
+        agent_ui::session_auto_import::init(cx);
+        app_state
+    });
+    let server_fs = FakeFs::new(server_cx.executor());
+    server_fs
+        .insert_tree("/project", serde_json::json!({ "src": {} }))
+        .await;
+    let (project, _headless, remote_connection) = start_remote_project(
+        &server_fs,
+        Path::new("/project"),
+        &app_state,
+        None,
+        cx,
+        server_cx,
+    )
+    .await;
+
+    // A thread imported earlier from the remote machine's agent.
+    cx.update(|cx| {
+        let metadata = ThreadMetadata {
+            thread_id: ThreadId::new(),
+            session_id: Some(acp::SessionId::new("remote-session")),
+            agent_id: AgentId::new("remote-agent"),
+            title: Some("Imported from the remote machine".into()),
+            title_override: None,
+            updated_at: chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 11, 12, 10, 0, 0).unwrap(),
+            created_at: None,
+            interacted_at: None,
+            worktree_paths: project.read(cx).worktree_paths(cx),
+            archived: false,
+            remote_connection: Some(remote_connection.clone()),
+        };
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
+    });
+    cx.run_until_parked();
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    // The window's agent connections, and the agents they were asked to connect.
+    let requested = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let connections = cx.update(|_window, cx| {
+        let connections = cx.new(|cx| {
+            agent_ui::agent_connection_store::AgentConnectionStore::new(project.clone(), cx)
+        });
+        let requested = requested.clone();
+        cx.observe(&connections, move |connections, cx| {
+            for agent in ["remote-agent", "other-remote-agent"] {
+                let key = agent_ui::Agent::Custom {
+                    id: AgentId::new(agent),
+                };
+                let mut requested = requested.borrow_mut();
+                if connections.read(cx).entry(&key).is_some()
+                    && !requested.iter().any(|name| name == agent)
+                {
+                    requested.push(agent.to_string());
+                }
+            }
+        })
+        .detach();
+        connections
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        *requested.borrow(),
+        Vec::<String>::new(),
+        "the remote machine hasn't named its agents yet"
+    );
+    // The stored thread shows before any agent is connected.
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [project]", "  Imported from the remote machine"]
+    );
+
+    // The remote machine's settings choose the agents its window imports.
+    server_cx.update(|cx| {
+        SettingsStore::update_global(cx, |settings_store, cx| {
+            settings_store
+                .set_server_settings(
+                    &serde_json::json!({
+                        "agent_servers": {
+                            "remote-agent": {
+                                "type": "custom",
+                                "command": "remote-cli",
+                                "auto_import_sessions": true
+                            },
+                            "other-remote-agent": {
+                                "type": "custom",
+                                "command": "other-cli"
+                            }
+                        }
+                    })
+                    .to_string(),
+                    cx,
+                )
+                .unwrap();
+        });
+    });
+    server_cx.run_until_parked();
+    cx.run_until_parked();
+    assert_eq!(*requested.borrow(), vec!["remote-agent".to_string()]);
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [project]", "  Imported from the remote machine"]
+    );
+    drop(connections);
 }

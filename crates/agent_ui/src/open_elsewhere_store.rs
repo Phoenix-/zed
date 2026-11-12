@@ -11,7 +11,8 @@
 use agent_client_protocol::schema::v2 as acp;
 use collections::{HashMap, HashSet};
 use gpui::{App, AppContext as _, Context, Entity, Global, SharedString};
-use project::AgentId;
+
+use crate::session_auto_import::SessionSource;
 
 /// Key in the `_meta` of a listed session's info that names the app that has the
 /// session open, such as "Codex Desktop". A listed session without it is free.
@@ -33,7 +34,7 @@ impl Global for GlobalOpenElsewhereStore {}
 
 #[derive(Default)]
 pub struct OpenElsewhereStore {
-    holders: HashMap<(AgentId, acp::SessionId), SharedString>,
+    holders: HashMap<(SessionSource, acp::SessionId), SharedString>,
 }
 
 impl OpenElsewhereStore {
@@ -48,16 +49,20 @@ impl OpenElsewhereStore {
     }
 
     /// The app that has the session open, as its agent last listed it.
-    pub fn holder(&self, agent_id: &AgentId, session_id: &acp::SessionId) -> Option<&SharedString> {
-        self.holders.get(&(agent_id.clone(), session_id.clone()))
+    pub fn holder(
+        &self,
+        source: &SessionSource,
+        session_id: &acp::SessionId,
+    ) -> Option<&SharedString> {
+        self.holders.get(&(source.clone(), session_id.clone()))
     }
 
-    /// Records what a listing of `agent_id`'s sessions reported. A listed session
+    /// Records what a listing of the source's sessions reported. A listed session
     /// takes the holder it was listed with, or none. When the listing is
-    /// complete, the agent's sessions missing from it are gone and lose theirs.
+    /// complete, the source's sessions missing from it are gone and lose theirs.
     pub fn apply_listing(
         &mut self,
-        agent_id: &AgentId,
+        source: &SessionSource,
         sessions: impl IntoIterator<Item = (acp::SessionId, Option<SharedString>)>,
         complete: bool,
         cx: &mut Context<Self>,
@@ -69,7 +74,7 @@ impl OpenElsewhereStore {
             if !listed.insert(session_id.clone()) {
                 continue;
             }
-            let key = (agent_id.clone(), session_id);
+            let key = (source.clone(), session_id);
             changed |= match holder {
                 Some(holder) => self.holders.insert(key, holder.clone()) != Some(holder),
                 None => self.holders.remove(&key).is_some(),
@@ -77,8 +82,8 @@ impl OpenElsewhereStore {
         }
         if complete {
             let count = self.holders.len();
-            self.holders.retain(|(holder_agent_id, session_id), _| {
-                holder_agent_id != agent_id || listed.contains(session_id)
+            self.holders.retain(|(holder_source, session_id), _| {
+                holder_source != source || listed.contains(session_id)
             });
             changed |= self.holders.len() != count;
         }
@@ -90,20 +95,20 @@ impl OpenElsewhereStore {
     /// Records the holder an agent reported for one session outside a listing.
     pub fn set_holder(
         &mut self,
-        agent_id: &AgentId,
+        source: &SessionSource,
         session_id: acp::SessionId,
         holder: Option<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        self.apply_listing(agent_id, [(session_id, holder)], false, cx);
+        self.apply_listing(source, [(session_id, holder)], false, cx);
     }
 
-    /// Forgets the marks of an agent Zed no longer hears from: without it, they
+    /// Forgets the marks of a source Zed no longer hears from: without it, they
     /// can't be kept up to date.
-    pub fn forget_agent(&mut self, agent_id: &AgentId, cx: &mut Context<Self>) {
+    pub fn forget_source(&mut self, source: &SessionSource, cx: &mut Context<Self>) {
         let count = self.holders.len();
         self.holders
-            .retain(|(holder_agent_id, _), _| holder_agent_id != agent_id);
+            .retain(|(holder_source, _), _| holder_source != source);
         if self.holders.len() != count {
             cx.notify();
         }
@@ -114,10 +119,24 @@ impl OpenElsewhereStore {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+    use project::AgentId;
+    use remote::{MockConnectionOptions, RemoteConnectionOptions};
+
+    fn local(agent: &str) -> SessionSource {
+        SessionSource::local(AgentId::new(agent))
+    }
 
     fn holder(store: &OpenElsewhereStore, agent: &str, session: &str) -> Option<String> {
+        holder_of(store, &local(agent), session)
+    }
+
+    fn holder_of(
+        store: &OpenElsewhereStore,
+        source: &SessionSource,
+        session: &str,
+    ) -> Option<String> {
         store
-            .holder(&AgentId::new(agent), &acp::SessionId::new(session))
+            .holder(source, &acp::SessionId::new(session))
             .map(|holder| holder.to_string())
     }
 
@@ -164,8 +183,8 @@ mod tests {
             })
             .detach();
         });
-        let codex = AgentId::new("codex");
-        let claude = AgentId::new("claude");
+        let codex = local("codex");
+        let claude = local("claude");
 
         store.update(cx, |store, cx| {
             store.apply_listing(
@@ -231,9 +250,44 @@ mod tests {
             assert!(holder(store, "claude", "desktop").is_some());
         });
 
-        store.update(cx, |store, cx| store.forget_agent(&claude, cx));
+        store.update(cx, |store, cx| store.forget_source(&claude, cx));
         store.read_with(cx, |store, _| {
             assert_eq!(holder(store, "claude", "desktop"), None);
+        });
+    }
+
+    #[gpui::test]
+    fn test_the_same_agent_on_another_machine_keeps_its_own_marks(cx: &mut TestAppContext) {
+        let store = cx.new(|_| OpenElsewhereStore::default());
+        let remote_connection = RemoteConnectionOptions::Mock(MockConnectionOptions { id: 1 });
+        let here = local("claude");
+        let there = SessionSource::new(AgentId::new("claude"), Some(&remote_connection));
+        assert_ne!(here, there);
+
+        store.update(cx, |store, cx| {
+            store.apply_listing(&here, listing(&[("s1", Some("VS Code"))]), true, cx);
+            store.apply_listing(&there, listing(&[("s2", Some("Codex Desktop"))]), true, cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(holder_of(store, &here, "s1").as_deref(), Some("VS Code"));
+            assert_eq!(holder_of(store, &here, "s2"), None);
+            assert_eq!(
+                holder_of(store, &there, "s2").as_deref(),
+                Some("Codex Desktop")
+            );
+        });
+
+        // A complete listing on one machine leaves the other machine's marks alone.
+        store.update(cx, |store, cx| {
+            store.apply_listing(&here, listing(&[]), true, cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(holder_of(store, &here, "s1"), None);
+            assert!(holder_of(store, &there, "s2").is_some());
+        });
+        store.update(cx, |store, cx| store.forget_source(&there, cx));
+        store.read_with(cx, |store, _| {
+            assert_eq!(holder_of(store, &there, "s2"), None);
         });
     }
 }

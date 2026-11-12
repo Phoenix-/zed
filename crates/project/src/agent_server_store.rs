@@ -10,8 +10,8 @@ use collections::HashMap;
 use fs::{Fs, RemoveOptions};
 use futures::StreamExt;
 use gpui::{
-    AppContext as _, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
-    TaskExt,
+    App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription,
+    Task, TaskExt,
 };
 use http_client::{HttpClient, github::AssetKind};
 use node_runtime::NodeRuntime;
@@ -156,6 +156,8 @@ enum AgentServerStoreState {
         project_id: u64,
         upstream_client: Entity<RemoteClient>,
         worktree_store: Entity<WorktreeStore>,
+        /// The agents the remote machine's settings enable `auto_import_sessions` for.
+        auto_import_agent_ids: Vec<AgentId>,
     },
     Collab,
 }
@@ -472,8 +474,6 @@ impl AgentServerStore {
             }
         }
 
-        *old_settings = Some(new_settings);
-
         if let Some((project_id, downstream_client)) = downstream_client {
             downstream_client
                 .send(proto::ExternalAgentsUpdated {
@@ -483,9 +483,15 @@ impl AgentServerStore {
                         .keys()
                         .map(|name| name.to_string())
                         .collect(),
+                    auto_import_names: new_settings
+                        .auto_import_agent_ids()
+                        .iter()
+                        .map(|name| name.to_string())
+                        .collect(),
                 })
                 .log_err();
         }
+        *old_settings = Some(new_settings);
         cx.emit(AgentServersUpdated);
     }
 
@@ -537,6 +543,7 @@ impl AgentServerStore {
                 project_id,
                 upstream_client,
                 worktree_store,
+                auto_import_agent_ids: Vec::new(),
             },
             external_agents: HashMap::default(),
         }
@@ -560,13 +567,23 @@ impl AgentServerStore {
                 // sets up its handlers.
                 cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(Duration::from_secs(1)).await;
-                    let names = this.update(cx, |this, _| {
-                        this.external_agents()
-                            .map(|name| name.to_string())
-                            .collect()
+                    let (names, auto_import_names) = this.update(cx, |this, cx| {
+                        (
+                            this.external_agents()
+                                .map(|name| name.to_string())
+                                .collect(),
+                            this.auto_import_agent_ids(cx)
+                                .iter()
+                                .map(|name| name.to_string())
+                                .collect(),
+                        )
                     })?;
                     client
-                        .send(proto::ExternalAgentsUpdated { project_id, names })
+                        .send(proto::ExternalAgentsUpdated {
+                            project_id,
+                            names,
+                            auto_import_names,
+                        })
                         .log_err();
                     anyhow::Ok(())
                 })
@@ -609,6 +626,27 @@ impl AgentServerStore {
 
     pub fn external_agents(&self) -> impl Iterator<Item = &AgentId> {
         self.external_agents.keys()
+    }
+
+    /// The agents whose sessions are imported on their own, as the settings of the
+    /// machine the project's agents run on say. Projects shared over collab run
+    /// no agents.
+    pub fn auto_import_agent_ids(&self, cx: &App) -> Vec<AgentId> {
+        match &self.state {
+            AgentServerStoreState::Local { .. } => cx
+                .try_global::<SettingsStore>()
+                .map(|settings| {
+                    settings
+                        .get::<AllAgentServersSettings>(None)
+                        .auto_import_agent_ids()
+                })
+                .unwrap_or_default(),
+            AgentServerStoreState::Remote {
+                auto_import_agent_ids,
+                ..
+            } => auto_import_agent_ids.clone(),
+            AgentServerStoreState::Collab => Vec::new(),
+        }
     }
 
     async fn handle_get_agent_server_command(
@@ -718,13 +756,20 @@ impl AgentServerStore {
                 project_id,
                 upstream_client,
                 worktree_store,
-            } = &this.state
+                auto_import_agent_ids,
+            } = &mut this.state
             else {
                 debug_panic!(
                     "handle_external_agents_updated should not be called for a non-remote project"
                 );
                 bail!("unexpected ExternalAgentsUpdated message")
             };
+            *auto_import_agent_ids = envelope
+                .payload
+                .auto_import_names
+                .into_iter()
+                .map(|name| AgentId(name.into()))
+                .collect();
 
             let mut previous_entries = std::mem::take(&mut this.external_agents);
             let mut new_version_available_txs = HashMap::default();
@@ -1527,6 +1572,14 @@ impl AllAgentServersSettings {
     pub fn has_registry_agents(&self) -> bool {
         self.values()
             .any(|s| matches!(s, CustomAgentServerSettings::Registry { .. }))
+    }
+
+    /// The agents whose sessions are imported on their own.
+    pub fn auto_import_agent_ids(&self) -> Vec<AgentId> {
+        self.iter()
+            .filter(|(_, settings)| settings.auto_import_sessions())
+            .map(|(name, _)| AgentId::new(name.clone()))
+            .collect()
     }
 }
 

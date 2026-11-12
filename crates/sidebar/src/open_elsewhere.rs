@@ -6,7 +6,10 @@
 //! what to do. Clicking it still opens it: the agent then answers with an error
 //! that says the same.
 
-use agent_ui::{open_elsewhere_store::OpenElsewhereStore, thread_metadata_store::ThreadMetadata};
+use agent_ui::{
+    open_elsewhere_store::OpenElsewhereStore, session_auto_import::SessionSource,
+    thread_metadata_store::ThreadMetadata,
+};
 use gpui::{AnyElement, App, Context, SharedString};
 use ui::{Tooltip, prelude::*};
 
@@ -19,7 +22,7 @@ pub(crate) fn holder(metadata: &ThreadMetadata, cx: &App) -> Option<SharedString
     let session_id = metadata.session_id.as_ref()?;
     OpenElsewhereStore::try_global(cx)?
         .read(cx)
-        .holder(&metadata.agent_id, session_id)
+        .holder(&SessionSource::of_thread(metadata), session_id)
         .cloned()
 }
 

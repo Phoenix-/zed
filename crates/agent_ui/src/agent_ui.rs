@@ -26,7 +26,7 @@ mod model_selector;
 mod model_selector_popover;
 pub mod open_elsewhere_store;
 mod profile_selector;
-mod session_auto_import;
+pub mod session_auto_import;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;

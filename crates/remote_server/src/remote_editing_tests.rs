@@ -5013,6 +5013,100 @@ async fn test_remote_external_agent_server(
     );
 }
 
+#[gpui::test]
+async fn test_remote_settings_choose_the_agents_to_auto_import(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/project"), json!({})).await;
+
+    let (project, _headless_project) = init_test(&fs, cx, server_cx).await;
+    project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/project"), true, cx)
+        })
+        .await
+        .unwrap();
+    // The user's settings reach the remote machine, and their agents run there.
+    cx.update_global::<SettingsStore, _>(|settings_store, cx| {
+        settings_store
+            .set_user_settings(
+                &json!({
+                    "agent_servers": {
+                        "from-user-settings": {
+                            "type": "custom",
+                            "command": "user-cli",
+                            "auto_import_sessions": true
+                        }
+                    }
+                })
+                .to_string(),
+                cx,
+            )
+            .unwrap();
+    });
+    let auto_import_names = |cx: &mut TestAppContext| {
+        project.update(cx, |project, cx| {
+            let mut names = project
+                .agent_server_store()
+                .read(cx)
+                .auto_import_agent_ids(cx)
+                .into_iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        })
+    };
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    cx.run_until_parked();
+    pretty_assertions::assert_eq!(auto_import_names(cx), ["from-user-settings"]);
+
+    let set_server_settings = |settings: serde_json::Value, server_cx: &mut TestAppContext| {
+        server_cx.update_global::<SettingsStore, _>(|settings_store, cx| {
+            settings_store
+                .set_server_settings(&settings.to_string(), cx)
+                .unwrap();
+        });
+    };
+    set_server_settings(
+        json!({
+            "agent_servers": {
+                "imported": {
+                    "type": "custom",
+                    "command": "imported-cli",
+                    "auto_import_sessions": true
+                },
+                "not-imported": {
+                    "type": "custom",
+                    "command": "other-cli"
+                }
+            }
+        }),
+        server_cx,
+    );
+    server_cx.run_until_parked();
+    cx.run_until_parked();
+    pretty_assertions::assert_eq!(auto_import_names(cx), ["from-user-settings", "imported"]);
+
+    set_server_settings(
+        json!({
+            "agent_servers": {
+                "imported": {
+                    "type": "custom",
+                    "command": "imported-cli"
+                }
+            }
+        }),
+        server_cx,
+    );
+    server_cx.run_until_parked();
+    cx.run_until_parked();
+    pretty_assertions::assert_eq!(auto_import_names(cx), ["from-user-settings"]);
+}
+
 #[cfg(not(windows))]
 #[gpui::test]
 async fn test_remote_external_agent_receives_env_over_stdin(
