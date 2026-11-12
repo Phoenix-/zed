@@ -153,13 +153,17 @@ pub struct SessionAutoImport {
     /// The archived state last requested from an agent for a session, until the
     /// agent reports the session's flag again.
     archive_requests: HashMap<(SessionSource, acp::SessionId), bool>,
+    /// Syncs the stores when a source's backoff expires: nothing else may.
+    retry_timers: HashMap<SessionSource, Task<()>>,
+    next_watcher_id: usize,
     _metadata_subscription: Option<Subscription>,
 }
 
 struct SessionListWatcher {
+    id: usize,
     source: SessionSource,
     session_list: Weak<dyn AgentSessionList>,
-    _task: Task<()>,
+    task: Task<()>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -169,14 +173,15 @@ struct ConnectAttempts {
 }
 
 impl ConnectAttempts {
-    fn allows_attempt(&mut self, now: Instant) -> bool {
-        let since_last_attempt = now.saturating_duration_since(self.last_attempt);
-        if since_last_attempt >= STABLE_CONNECTION {
+    /// When the next attempt may be made, or `None` while attempts are given up.
+    fn next_attempt(&mut self, now: Instant) -> Option<Instant> {
+        if now.saturating_duration_since(self.last_attempt) >= STABLE_CONNECTION {
             self.count = 0;
-            return true;
+            return Some(now);
         }
-        self.count < MAX_CONNECT_ATTEMPTS
-            && since_last_attempt >= CONNECT_RETRY_DELAY * 2u32.pow(self.count.saturating_sub(1))
+        (self.count < MAX_CONNECT_ATTEMPTS).then(|| {
+            self.last_attempt + CONNECT_RETRY_DELAY * 2u32.pow(self.count.saturating_sub(1))
+        })
     }
 }
 
@@ -206,9 +211,9 @@ struct KnownSession {
 /// A source as its known sessions are stored: the agent, and the remote
 /// machine's persistence key, empty for this machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct StoredSource {
-    agent_id: String,
-    remote: String,
+pub(crate) struct StoredSource {
+    pub(crate) agent_id: String,
+    pub(crate) remote: String,
 }
 
 impl From<&SessionSource> for StoredSource {
@@ -397,6 +402,8 @@ impl SessionAutoImport {
                 _write_task: write_task,
             },
             archive_requests: HashMap::default(),
+            retry_timers: HashMap::default(),
+            next_watcher_id: 0,
             _metadata_subscription: metadata_subscription,
         }
     }
@@ -503,6 +510,8 @@ impl SessionAutoImport {
             .retain(|source, _| source.is_local() || enabled.contains(source));
         self.unsupported_sources
             .retain(|source| source.is_local() || enabled.contains(source));
+        self.retry_timers
+            .retain(|source, _| enabled.contains(source));
 
         for source in sources {
             let agent = Agent::from(source.agent_id.clone());
@@ -547,22 +556,47 @@ impl SessionAutoImport {
                         // The store drops entries whose connection failed.
                         log::warn!("Connecting to {source} to import its sessions failed");
                     }
-                    let now = cx.background_executor().now();
-                    let should_connect = !self.is_watching(&source)
-                        && !self
+                    if self.is_watching(&source)
+                        || self
                             .pending_connections
                             .iter()
                             .any(|(pending, _)| pending == &source)
-                        && self
-                            .connect_attempts
-                            .get_mut(&source)
-                            .is_none_or(|attempts| attempts.allows_attempt(now));
-                    if should_connect {
-                        self.connect(store, source, now, cx);
+                    {
+                        continue;
+                    }
+                    let now = cx.background_executor().now();
+                    let next_attempt = match self.connect_attempts.get_mut(&source) {
+                        Some(attempts) => attempts.next_attempt(now),
+                        None => Some(now),
+                    };
+                    match next_attempt {
+                        Some(next_attempt) if next_attempt <= now => {
+                            self.connect(store, source, now, cx)
+                        }
+                        Some(next_attempt) => self.retry_at(source, next_attempt - now, cx),
+                        // Given up until the agent's settings change or a while passes.
+                        None => {}
                     }
                 }
             }
         }
+    }
+
+    /// Syncs the stores once the source's backoff expires, so that a connection
+    /// that failed is retried without waiting for something else to change.
+    fn retry_at(&mut self, source: SessionSource, delay: Duration, cx: &mut Context<Self>) {
+        let task = cx.spawn({
+            let source = source.clone();
+            async move |this, cx| {
+                cx.background_executor().timer(delay).await;
+                this.update(cx, |this, cx| {
+                    this.retry_timers.remove(&source);
+                    this.sync_all_stores(cx);
+                })
+                .ok();
+            }
+        });
+        self.retry_timers.insert(source, task);
     }
 
     fn connect(
@@ -613,15 +647,24 @@ impl SessionAutoImport {
             return;
         }
         self.watchers.retain(|watcher| watcher.source != source);
+        self.retry_timers.remove(&source);
+        let id = self.next_watcher_id;
+        self.next_watcher_id += 1;
 
-        let updates = session_list.watch(cx);
-        let poll_interval = (!session_list.notifies_changes()).then_some(POLL_INTERVAL);
+        // A list whose updates have ended is polled, so that a watcher that stops
+        // when they end isn't started again and again on the same list.
+        let updates = session_list
+            .watch(cx)
+            .filter(|updates| !updates.is_closed());
+        let poll_interval =
+            (updates.is_none() || !session_list.notifies_changes()).then_some(POLL_INTERVAL);
         let task = cx.spawn({
             let source = source.clone();
             let session_list = Rc::downgrade(&session_list);
             async move |this, cx| {
                 watch_session_list(
                     this,
+                    id,
                     source,
                     remote_connection,
                     session_list,
@@ -633,10 +676,30 @@ impl SessionAutoImport {
             }
         });
         self.watchers.push(SessionListWatcher {
+            id,
             source,
             session_list: Rc::downgrade(&session_list),
-            _task: task,
+            task,
         });
+    }
+
+    /// A watcher stops when its session list goes, which may be after the
+    /// windows that need its agent last synced, as when one of two windows on a
+    /// remote machine closes: they sync again, and the window left connects.
+    fn stop_watcher(&mut self, id: usize, cx: &mut Context<Self>) {
+        if let Some(index) = self.watchers.iter().position(|watcher| watcher.id == id) {
+            let watcher = self.watchers.remove(index);
+            // The task is finishing: dropping it would cancel it while it runs.
+            watcher.task.detach();
+            if !self
+                .watchers
+                .iter()
+                .any(|other| other.source == watcher.source)
+            {
+                forget_open_elsewhere(&watcher.source, cx);
+            }
+        }
+        self.sync_all_stores(cx);
     }
 
     fn open_thread_ids(&self, cx: &App) -> HashSet<ThreadId> {
@@ -745,7 +808,7 @@ impl SessionAutoImport {
                 for (session_id, parent_session_id) in parent_links {
                     if sessions_with_threads.contains(&session_id) {
                         parent_store.set_parent_session_id(
-                            source.agent_id.clone(),
+                            source.clone(),
                             session_id,
                             parent_session_id,
                             cx,
@@ -816,7 +879,7 @@ impl SessionAutoImport {
         if let Some(parent_store) = ThreadParentStore::try_global(cx) {
             parent_store.update(cx, |parent_store, cx| {
                 parent_store.set_parent_session_id(
-                    source.agent_id.clone(),
+                    source.clone(),
                     session_id,
                     Some(parent_session_id),
                     cx,
@@ -1201,6 +1264,7 @@ fn plan_sync(
 
 async fn watch_session_list(
     this: WeakEntity<SessionAutoImport>,
+    watcher_id: usize,
     source: SessionSource,
     remote_connection: Option<RemoteConnectionOptions>,
     session_list: Weak<dyn AgentSessionList>,
@@ -1282,7 +1346,12 @@ async fn watch_session_list(
             }
         }
     }
-    cx.update(|cx| forget_open_elsewhere(&source, cx));
+    if this
+        .update(cx, |this, cx| this.stop_watcher(watcher_id, cx))
+        .is_err()
+    {
+        cx.update(|cx| forget_open_elsewhere(&source, cx));
+    }
 }
 
 /// Without a listing to keep them up to date, the marks of a source's sessions
@@ -1385,9 +1454,12 @@ impl Domain for SessionAutoImportDb {
         ),
         sql!(ALTER TABLE auto_import_known_sessions ADD COLUMN archived INTEGER;),
         // Sessions are known per source: `remote` is the remote machine's
-        // persistence key, empty for this machine.
+        // persistence key, empty for this machine. The table of earlier builds
+        // stays as they expect it and keeps this machine's sessions, so that such
+        // a build, run again on this database, takes no remote session for one of
+        // its own.
         sql!(
-            CREATE TABLE auto_import_known_sessions_v2(
+            CREATE TABLE auto_import_known_sessions_by_source(
                 agent_id TEXT NOT NULL,
                 remote TEXT NOT NULL DEFAULT "",
                 session_id TEXT NOT NULL,
@@ -1396,12 +1468,9 @@ impl Domain for SessionAutoImportDb {
                 PRIMARY KEY (agent_id, remote, session_id)
             ) STRICT;
 
-            INSERT INTO auto_import_known_sessions_v2(agent_id, session_id, imported, archived)
+            INSERT INTO auto_import_known_sessions_by_source(agent_id, session_id, imported, archived)
             SELECT agent_id, session_id, imported, archived
             FROM auto_import_known_sessions;
-
-            DROP TABLE auto_import_known_sessions;
-            ALTER TABLE auto_import_known_sessions_v2 RENAME TO auto_import_known_sessions;
         ),
     ];
 }
@@ -1411,7 +1480,8 @@ db::static_connection!(SessionAutoImportDb, []);
 impl SessionAutoImportDb {
     fn list(&self) -> anyhow::Result<Vec<(StoredSource, String, bool, Option<bool>)>> {
         let rows = self.select::<(String, String, String, bool, Option<bool>)>(
-            "SELECT agent_id, remote, session_id, imported, archived FROM auto_import_known_sessions",
+            "SELECT agent_id, remote, session_id, imported, archived \
+             FROM auto_import_known_sessions_by_source",
         )?()?;
         Ok(rows
             .into_iter()
@@ -1435,7 +1505,7 @@ impl SessionAutoImportDb {
             } => {
                 let mut statement = Statement::prepare(
                     conn,
-                    "INSERT INTO auto_import_known_sessions(agent_id, remote, session_id, imported, archived) \
+                    "INSERT INTO auto_import_known_sessions_by_source(agent_id, remote, session_id, imported, archived) \
                      VALUES (?1, ?2, ?3, ?4, ?5) \
                      ON CONFLICT(agent_id, remote, session_id) DO UPDATE SET \
                      imported = excluded.imported, archived = excluded.archived",
@@ -1445,16 +1515,42 @@ impl SessionAutoImportDb {
                 index = statement.bind(&session_id, index)?;
                 index = statement.bind(&session.imported, index)?;
                 statement.bind(&session.archived, index)?;
+                statement.exec()?;
+                if !source.remote.is_empty() {
+                    return Ok(());
+                }
+                // Earlier builds read this machine's sessions from their own table.
+                let mut statement = Statement::prepare(
+                    conn,
+                    "INSERT INTO auto_import_known_sessions(agent_id, session_id, imported, archived) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(agent_id, session_id) DO UPDATE SET \
+                     imported = excluded.imported, archived = excluded.archived",
+                )?;
+                let mut index = statement.bind(&source.agent_id, 1)?;
+                index = statement.bind(&session_id, index)?;
+                index = statement.bind(&session.imported, index)?;
+                statement.bind(&session.archived, index)?;
                 statement.exec()
             }
             KnownSessionWrite::Delete { source, session_id } => {
                 let mut statement = Statement::prepare(
                     conn,
-                    "DELETE FROM auto_import_known_sessions \
+                    "DELETE FROM auto_import_known_sessions_by_source \
                      WHERE agent_id = ?1 AND remote = ?2 AND session_id = ?3",
                 )?;
                 let mut index = statement.bind(&source.agent_id, 1)?;
                 index = statement.bind(&source.remote, index)?;
+                statement.bind(&session_id, index)?;
+                statement.exec()?;
+                if !source.remote.is_empty() {
+                    return Ok(());
+                }
+                let mut statement = Statement::prepare(
+                    conn,
+                    "DELETE FROM auto_import_known_sessions WHERE agent_id = ?1 AND session_id = ?2",
+                )?;
+                let index = statement.bind(&source.agent_id, 1)?;
                 statement.bind(&session_id, index)?;
                 statement.exec()
             }
@@ -2042,6 +2138,14 @@ mod tests {
         assert_eq!(machines_of("s1", cx), [None]);
     }
 
+    /// What builds from before remote sources read, and how they write.
+    const EARLIER_BUILDS_LIST: &str =
+        "SELECT agent_id, session_id, imported, archived FROM auto_import_known_sessions";
+    const EARLIER_BUILDS_SAVE: &str = "INSERT INTO auto_import_known_sessions(agent_id, session_id, imported, archived) \
+         VALUES ('gorynych', 'saved-by-an-earlier-build', 1, NULL) \
+         ON CONFLICT(agent_id, session_id) DO UPDATE SET \
+         imported = excluded.imported, archived = excluded.archived";
+
     #[test]
     fn test_known_sessions_from_before_remote_sources_belong_to_this_machine() {
         let connection = db::sqlez::connection::Connection::open_memory(Some(
@@ -2068,7 +2172,7 @@ mod tests {
         let rows = connection
             .select::<(String, String, String, bool, Option<bool>)>(
                 "SELECT agent_id, remote, session_id, imported, archived \
-                 FROM auto_import_known_sessions",
+                 FROM auto_import_known_sessions_by_source",
             )
             .unwrap()()
         .unwrap();
@@ -2090,6 +2194,85 @@ mod tests {
             source,
             SessionSource::local(AgentId::new("Gorynych: Claude"))
         );
+
+        // Earlier builds still find their table as they left it.
+        let earlier = connection
+            .select::<(String, String, bool, Option<bool>)>(EARLIER_BUILDS_LIST)
+            .unwrap()()
+        .unwrap();
+        assert_eq!(
+            earlier,
+            [(
+                "Gorynych: Claude".to_string(),
+                "s1".to_string(),
+                true,
+                Some(false)
+            )]
+        );
+        connection.exec(EARLIER_BUILDS_SAVE).unwrap()().unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_earlier_builds_see_only_this_machines_sessions(_cx: &mut TestAppContext) {
+        let db = SessionAutoImportDb(
+            db::open_test_db::<SessionAutoImportDb>("test_earlier_builds_see_only_this_machine")
+                .await,
+        );
+        let here = SessionSource::local(AgentId::new("gorynych"));
+        let there = SessionSource::new(AgentId::new("gorynych"), Some(&mock_remote(5)));
+        let imported = KnownSession {
+            imported: true,
+            archived: None,
+        };
+        for (source, session_id) in [(&here, "local"), (&there, "remote"), (&here, "gone")] {
+            db.apply(KnownSessionWrite::Save {
+                source: source.into(),
+                session_id: session_id.to_string(),
+                session: imported,
+            })
+            .await
+            .unwrap();
+        }
+        db.apply(KnownSessionWrite::Delete {
+            source: (&here).into(),
+            session_id: "gone".to_string(),
+        })
+        .await
+        .unwrap();
+        db.apply(KnownSessionWrite::Delete {
+            source: (&there).into(),
+            session_id: "local".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let mut known = db
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|(source, session_id, _, _)| (SessionSource::from(source), session_id))
+            .collect::<Vec<_>>();
+        known.sort_by_key(|(_, session_id)| session_id.clone());
+        assert_eq!(
+            known,
+            [
+                (here.clone(), "local".to_string()),
+                (there.clone(), "remote".to_string())
+            ]
+        );
+        // A build from before remote sources never sees the remote session as
+        // one of this machine's, so its listings can't drop the remote thread.
+        let earlier = db
+            .select::<(String, String, bool, Option<bool>)>(EARLIER_BUILDS_LIST)
+            .unwrap()()
+        .unwrap();
+        assert_eq!(
+            earlier,
+            [("gorynych".to_string(), "local".to_string(), true, None)]
+        );
+        db.write(|conn| conn.exec(EARLIER_BUILDS_SAVE).unwrap()())
+            .await
+            .unwrap();
     }
 
     #[gpui::test]
@@ -2121,7 +2304,10 @@ mod tests {
         cx.read(|cx| {
             ThreadParentStore::global(cx)
                 .read(cx)
-                .parent_session_id(&AgentId::new(agent), &acp::SessionId::new(session_id))
+                .parent_session_id(
+                    &SessionSource::local(AgentId::new(agent)),
+                    &acp::SessionId::new(session_id),
+                )
                 .map(|parent| parent.0.to_string())
         })
     }
@@ -2625,6 +2811,43 @@ mod tests {
         }));
     }
 
+    #[gpui::test]
+    async fn test_watching_stops_when_the_session_list_stops_reporting(cx: &mut TestAppContext) {
+        let auto_import = init_test(cx);
+        let list = FakeSessionList::new(true, vec![session("s1", "First", "/project", 1)]);
+        watch(&auto_import, &list, cx);
+
+        // The connection is still around, but its session list no longer reports.
+        list.updates_tx.close();
+        cx.run_until_parked();
+        assert!(auto_import.read_with(cx, |auto_import, _| {
+            auto_import.watchers.is_empty()
+                && !auto_import.is_watching(&SessionSource::local(AgentId::new("gorynych")))
+        }));
+
+        // Another connection to the agent, as from another window, takes over.
+        let other = FakeSessionList::new(true, vec![session("s2", "Second", "/project", 2)]);
+        watch(&auto_import, &other, cx);
+        assert!(thread("s2", cx).is_some());
+
+        // Watching a list whose updates have ended falls back to polling it.
+        drop(other);
+        cx.run_until_parked();
+        let calls = list.list_calls.get();
+        list.sessions
+            .borrow_mut()
+            .push(session("s3", "Third", "/project", 3));
+        watch(&auto_import, &list, cx);
+        assert_eq!(list.list_calls.get(), calls + 1);
+        assert!(thread("s3", cx).is_some());
+        cx.executor().advance_clock(POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(list.list_calls.get(), calls + 2);
+        assert!(auto_import.read_with(cx, |auto_import, _| {
+            auto_import.is_watching(&SessionSource::local(AgentId::new("gorynych")))
+        }));
+    }
+
     #[test]
     fn test_sessions_held_by_live_threads_are_not_imported() {
         let plan = plan_sync(
@@ -2718,15 +2941,23 @@ mod tests {
             count: 1,
             last_attempt: start,
         };
-        assert!(!attempts.allows_attempt(start + Duration::from_secs(10)));
-        assert!(attempts.allows_attempt(start + CONNECT_RETRY_DELAY));
+        assert_eq!(
+            attempts.next_attempt(start + Duration::from_secs(10)),
+            Some(start + CONNECT_RETRY_DELAY)
+        );
         attempts.count = 2;
-        assert!(!attempts.allows_attempt(start + CONNECT_RETRY_DELAY));
-        assert!(attempts.allows_attempt(start + CONNECT_RETRY_DELAY * 2));
+        assert_eq!(
+            attempts.next_attempt(start + CONNECT_RETRY_DELAY),
+            Some(start + CONNECT_RETRY_DELAY * 2)
+        );
         attempts.count = MAX_CONNECT_ATTEMPTS;
-        assert!(!attempts.allows_attempt(start + Duration::from_secs(9 * 60)));
+        assert_eq!(
+            attempts.next_attempt(start + Duration::from_secs(9 * 60)),
+            None
+        );
         // A connection that lasted counts as working again.
-        assert!(attempts.allows_attempt(start + STABLE_CONNECTION));
+        let later = start + STABLE_CONNECTION;
+        assert_eq!(attempts.next_attempt(later), Some(later));
         assert_eq!(attempts.count, 0);
     }
 

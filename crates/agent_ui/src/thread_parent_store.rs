@@ -5,8 +5,8 @@
 //!
 //! The links live in their own database domain rather than in a column of the
 //! thread metadata table, so that they never interfere with the migrations of
-//! that table. A link belongs to a session of one agent, while the parent may be
-//! a session of another agent.
+//! that table. A link belongs to a session of one agent on one machine, while the
+//! parent may be a session of another agent.
 
 use agent_client_protocol::schema::v2 as acp;
 use anyhow::Context as _;
@@ -17,10 +17,12 @@ use db::{
 };
 use futures::{FutureExt as _, future::Shared};
 use gpui::{App, AppContext as _, Context, Entity, Global, Task};
-use project::AgentId;
 use util::ResultExt as _;
 
-use crate::thread_metadata_store::ThreadMetadataStore;
+use crate::{
+    session_auto_import::{SessionSource, StoredSource},
+    thread_metadata_store::ThreadMetadataStore,
+};
 
 /// Key in the `_meta` of a session's info that names the session that started it.
 pub const PARENT_SESSION_ID_META_KEY: &str = "gorynych/parentSessionId";
@@ -42,7 +44,7 @@ struct GlobalThreadParentStore(Entity<ThreadParentStore>);
 
 impl Global for GlobalThreadParentStore {}
 
-type SessionKey = (AgentId, acp::SessionId);
+type SessionKey = (SessionSource, acp::SessionId);
 
 pub struct ThreadParentStore {
     parents: HashMap<SessionKey, acp::SessionId>,
@@ -51,7 +53,7 @@ pub struct ThreadParentStore {
     /// that the links of deleted threads go with them. `None` until it has loaded.
     thread_sessions: Option<HashSet<SessionKey>>,
     /// Writes go through one queue so that they apply in the order they are made.
-    pending_writes: async_channel::Sender<(String, String, Option<String>)>,
+    pending_writes: async_channel::Sender<(StoredSource, String, Option<String>)>,
     _write_task: Task<()>,
     _metadata_subscription: Option<gpui::Subscription>,
 }
@@ -103,10 +105,10 @@ impl ThreadParentStore {
                     metadata_loaded.await;
                 }
                 this.update(cx, |this, cx| {
-                    for (agent_id, session_id, parent_session_id) in rows.into_iter().flatten() {
+                    for (source, session_id, parent_session_id) in rows.into_iter().flatten() {
                         // Links set while loading are newer than the stored ones.
                         this.parents
-                            .entry((AgentId::new(agent_id), acp::SessionId::new(session_id)))
+                            .entry((SessionSource::from(source), acp::SessionId::new(session_id)))
                             .or_insert_with(|| acp::SessionId::new(parent_session_id));
                     }
                     if let Some(metadata_store) = ThreadMetadataStore::try_global(cx) {
@@ -119,10 +121,10 @@ impl ThreadParentStore {
             .shared();
 
         let (pending_writes, writes) =
-            async_channel::unbounded::<(String, String, Option<String>)>();
+            async_channel::unbounded::<(StoredSource, String, Option<String>)>();
         let write_task = cx.background_spawn(async move {
-            while let Ok((agent_id, session_id, parent_session_id)) = writes.recv().await {
-                db.save(agent_id, session_id, parent_session_id)
+            while let Ok((source, session_id, parent_session_id)) = writes.recv().await {
+                db.save(source, session_id, parent_session_id)
                     .await
                     .log_err();
             }
@@ -144,21 +146,21 @@ impl ThreadParentStore {
 
     pub fn parent_session_id(
         &self,
-        agent_id: &AgentId,
+        source: &SessionSource,
         session_id: &acp::SessionId,
     ) -> Option<&acp::SessionId> {
-        self.parents.get(&(agent_id.clone(), session_id.clone()))
+        self.parents.get(&(source.clone(), session_id.clone()))
     }
 
     pub fn set_parent_session_id(
         &mut self,
-        agent_id: AgentId,
+        source: SessionSource,
         session_id: acp::SessionId,
         parent_session_id: Option<acp::SessionId>,
         cx: &mut Context<Self>,
     ) {
         let parent_session_id = parent_session_id.filter(|parent| parent != &session_id);
-        let key = (agent_id, session_id);
+        let key = (source, session_id);
         if self.parents.get(&key) == parent_session_id.as_ref() {
             return;
         }
@@ -170,10 +172,10 @@ impl ThreadParentStore {
         cx.notify();
     }
 
-    fn write(&self, (agent_id, session_id): &SessionKey, parent: Option<&acp::SessionId>) {
+    fn write(&self, (source, session_id): &SessionKey, parent: Option<&acp::SessionId>) {
         self.pending_writes
             .try_send((
-                agent_id.to_string(),
+                source.into(),
                 session_id.0.to_string(),
                 parent.map(|parent| parent.0.to_string()),
             ))
@@ -198,7 +200,7 @@ impl ThreadParentStore {
 fn thread_sessions(metadata_store: &ThreadMetadataStore) -> HashSet<SessionKey> {
     metadata_store
         .entries()
-        .filter_map(|thread| Some((thread.agent_id.clone(), thread.session_id.clone()?)))
+        .filter_map(|thread| Some((SessionSource::of_thread(thread), thread.session_id.clone()?)))
         .collect()
 }
 
@@ -207,53 +209,115 @@ struct ThreadParentDb(ThreadSafeConnection);
 impl Domain for ThreadParentDb {
     const NAME: &str = stringify!(ThreadParentDb);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS agent_session_parents(
-            agent_id TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            parent_session_id TEXT NOT NULL,
-            PRIMARY KEY (agent_id, session_id)
-        ) STRICT;
-    )];
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE IF NOT EXISTS agent_session_parents(
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                parent_session_id TEXT NOT NULL,
+                PRIMARY KEY (agent_id, session_id)
+            ) STRICT;
+        ),
+        // Links are kept per machine: `remote` is the remote machine's
+        // persistence key, empty for this machine. Earlier builds keep their own
+        // table with this machine's links.
+        sql!(
+            CREATE TABLE agent_session_parents_by_source(
+                agent_id TEXT NOT NULL,
+                remote TEXT NOT NULL DEFAULT "",
+                session_id TEXT NOT NULL,
+                parent_session_id TEXT NOT NULL,
+                PRIMARY KEY (agent_id, remote, session_id)
+            ) STRICT;
+
+            INSERT INTO agent_session_parents_by_source(agent_id, session_id, parent_session_id)
+            SELECT agent_id, session_id, parent_session_id
+            FROM agent_session_parents;
+        ),
+    ];
 }
 
 db::static_connection!(ThreadParentDb, []);
 
 impl ThreadParentDb {
-    fn list(&self) -> anyhow::Result<Vec<(String, String, String)>> {
-        self.select::<(String, String, String)>(
-            "SELECT agent_id, session_id, parent_session_id FROM agent_session_parents",
-        )?()
+    fn list(&self) -> anyhow::Result<Vec<(StoredSource, String, String)>> {
+        let rows = self.select::<(String, String, String, String)>(
+            "SELECT agent_id, remote, session_id, parent_session_id \
+             FROM agent_session_parents_by_source",
+        )?()?;
+        Ok(rows
+            .into_iter()
+            .map(|(agent_id, remote, session_id, parent_session_id)| {
+                (
+                    StoredSource { agent_id, remote },
+                    session_id,
+                    parent_session_id,
+                )
+            })
+            .collect())
     }
 
     async fn save(
         &self,
-        agent_id: String,
+        source: StoredSource,
         session_id: String,
         parent_session_id: Option<String>,
     ) -> anyhow::Result<()> {
-        self.write(move |conn| match parent_session_id {
-            Some(parent_session_id) => {
-                let mut statement = Statement::prepare(
-                    conn,
-                    "INSERT INTO agent_session_parents(agent_id, session_id, parent_session_id) \
-                     VALUES (?1, ?2, ?3) \
-                     ON CONFLICT(agent_id, session_id) DO UPDATE SET \
-                         parent_session_id = excluded.parent_session_id",
-                )?;
-                let mut index = statement.bind(&agent_id, 1)?;
-                index = statement.bind(&session_id, index)?;
-                statement.bind(&parent_session_id, index)?;
-                statement.exec()
+        self.write(move |conn| {
+            match &parent_session_id {
+                Some(parent_session_id) => {
+                    let mut statement = Statement::prepare(
+                        conn,
+                        "INSERT INTO agent_session_parents_by_source(agent_id, remote, session_id, parent_session_id) \
+                         VALUES (?1, ?2, ?3, ?4) \
+                         ON CONFLICT(agent_id, remote, session_id) DO UPDATE SET \
+                             parent_session_id = excluded.parent_session_id",
+                    )?;
+                    let mut index = statement.bind(&source.agent_id, 1)?;
+                    index = statement.bind(&source.remote, index)?;
+                    index = statement.bind(&session_id, index)?;
+                    statement.bind(parent_session_id, index)?;
+                    statement.exec()?;
+                }
+                None => {
+                    let mut statement = Statement::prepare(
+                        conn,
+                        "DELETE FROM agent_session_parents_by_source \
+                         WHERE agent_id = ?1 AND remote = ?2 AND session_id = ?3",
+                    )?;
+                    let mut index = statement.bind(&source.agent_id, 1)?;
+                    index = statement.bind(&source.remote, index)?;
+                    statement.bind(&session_id, index)?;
+                    statement.exec()?;
+                }
             }
-            None => {
-                let mut statement = Statement::prepare(
-                    conn,
-                    "DELETE FROM agent_session_parents WHERE agent_id = ?1 AND session_id = ?2",
-                )?;
-                let index = statement.bind(&agent_id, 1)?;
-                statement.bind(&session_id, index)?;
-                statement.exec()
+            if !source.remote.is_empty() {
+                return Ok(());
+            }
+            // Earlier builds read this machine's links from their own table.
+            match &parent_session_id {
+                Some(parent_session_id) => {
+                    let mut statement = Statement::prepare(
+                        conn,
+                        "INSERT INTO agent_session_parents(agent_id, session_id, parent_session_id) \
+                         VALUES (?1, ?2, ?3) \
+                         ON CONFLICT(agent_id, session_id) DO UPDATE SET \
+                             parent_session_id = excluded.parent_session_id",
+                    )?;
+                    let mut index = statement.bind(&source.agent_id, 1)?;
+                    index = statement.bind(&session_id, index)?;
+                    statement.bind(parent_session_id, index)?;
+                    statement.exec()
+                }
+                None => {
+                    let mut statement = Statement::prepare(
+                        conn,
+                        "DELETE FROM agent_session_parents WHERE agent_id = ?1 AND session_id = ?2",
+                    )?;
+                    let index = statement.bind(&source.agent_id, 1)?;
+                    statement.bind(&session_id, index)?;
+                    statement.exec()
+                }
             }
         })
         .await
@@ -265,15 +329,20 @@ mod tests {
     use super::*;
     use crate::thread_metadata_store::{ThreadId, ThreadMetadata, WorktreePaths};
     use gpui::TestAppContext;
+    use project::AgentId;
+    use remote::{MockConnectionOptions, RemoteConnectionOptions};
 
-    fn key(agent: &str, session: &str) -> (AgentId, acp::SessionId) {
-        (AgentId::new(agent), acp::SessionId::new(session))
+    fn key(agent: &str, session: &str) -> (SessionSource, acp::SessionId) {
+        (
+            SessionSource::local(AgentId::new(agent)),
+            acp::SessionId::new(session),
+        )
     }
 
     fn parent(store: &ThreadParentStore, agent: &str, session: &str) -> Option<String> {
-        let (agent_id, session_id) = key(agent, session);
+        let (source, session_id) = key(agent, session);
         store
-            .parent_session_id(&agent_id, &session_id)
+            .parent_session_id(&source, &session_id)
             .map(|parent| parent.0.to_string())
     }
 
@@ -300,9 +369,9 @@ mod tests {
 
         store.update(cx, |store, cx| {
             let mut set = |agent: &str, session: &str, parent: Option<&str>| {
-                let (agent_id, session_id) = key(agent, session);
+                let (source, session_id) = key(agent, session);
                 store.set_parent_session_id(
-                    agent_id,
+                    source,
                     session_id,
                     parent.map(acp::SessionId::new),
                     cx,
@@ -333,6 +402,65 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_links_are_kept_per_machine(cx: &mut TestAppContext) {
+        let db = ThreadParentDb(
+            db::open_test_db::<ThreadParentDb>("test_links_are_kept_per_machine").await,
+        );
+        let store = cx.new(|cx| ThreadParentStore::new(db.clone(), cx));
+        cx.run_until_parked();
+        let here = SessionSource::local(AgentId::new("kimi"));
+        let there = SessionSource::new(
+            AgentId::new("kimi"),
+            Some(&RemoteConnectionOptions::Mock(MockConnectionOptions {
+                id: 9,
+            })),
+        );
+        let coder = acp::SessionId::new("coder");
+        store.update(cx, |store, cx| {
+            store.set_parent_session_id(
+                here.clone(),
+                coder.clone(),
+                Some(acp::SessionId::new("local-coordinator")),
+                cx,
+            );
+            store.set_parent_session_id(
+                there.clone(),
+                coder.clone(),
+                Some(acp::SessionId::new("remote-coordinator")),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let reloaded = cx.new(|cx| ThreadParentStore::new(db.clone(), cx));
+        cx.run_until_parked();
+        reloaded.read_with(cx, |store, _| {
+            let parent = |source| {
+                store
+                    .parent_session_id(source, &coder)
+                    .map(|parent| parent.0.to_string())
+            };
+            assert_eq!(parent(&here).as_deref(), Some("local-coordinator"));
+            assert_eq!(parent(&there).as_deref(), Some("remote-coordinator"));
+        });
+        // Builds from before remote machines read only this machine's links.
+        let earlier = db
+            .select::<(String, String, String)>(
+                "SELECT agent_id, session_id, parent_session_id FROM agent_session_parents",
+            )
+            .unwrap()()
+        .unwrap();
+        assert_eq!(
+            earlier,
+            [(
+                "kimi".to_string(),
+                "coder".to_string(),
+                "local-coordinator".to_string()
+            )]
+        );
+    }
+
+    #[gpui::test]
     async fn test_links_go_with_their_threads(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
@@ -359,9 +487,9 @@ mod tests {
         cx.update(|cx| {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(thread, cx));
             ThreadParentStore::global(cx).update(cx, |store, cx| {
-                let (agent_id, session_id) = key("kimi", "coder");
+                let (source, session_id) = key("kimi", "coder");
                 store.set_parent_session_id(
-                    agent_id,
+                    source,
                     session_id,
                     Some(acp::SessionId::new("coordinator")),
                     cx,

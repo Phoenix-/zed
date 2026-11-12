@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 
 use agent_client_protocol::schema::v2 as acp;
 use agent_ui::{
-    ThreadId, thread_metadata_store::ThreadMetadataStore, thread_parent_store::ThreadParentStore,
+    ThreadId, session_auto_import::SessionSource, thread_metadata_store::ThreadMetadataStore,
+    thread_parent_store::ThreadParentStore,
 };
 use chrono::{DateTime, Utc};
 use gpui::{AnyElement, App, Context, Pixels, SharedString, px};
@@ -191,7 +192,8 @@ pub(crate) fn nest_group_rows(
             .session_id
             .as_ref()
             .and_then(|session_id| {
-                parent_store.parent_session_id(&thread.metadata.agent_id, session_id)
+                parent_store
+                    .parent_session_id(&SessionSource::of_thread(&thread.metadata), session_id)
             })
             .cloned(),
         ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,

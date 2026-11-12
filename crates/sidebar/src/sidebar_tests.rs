@@ -16045,7 +16045,7 @@ fn set_thread_parent(child: &str, parent: &str, cx: &mut TestAppContext) {
     cx.update(|cx| {
         agent_ui::thread_parent_store::ThreadParentStore::global(cx).update(cx, |store, cx| {
             store.set_parent_session_id(
-                agent::ZED_AGENT_ID.clone(),
+                agent_ui::session_auto_import::SessionSource::local(agent::ZED_AGENT_ID.clone()),
                 acp::SessionId::new(child),
                 Some(acp::SessionId::new(parent)),
                 cx,
@@ -16519,23 +16519,25 @@ async fn test_remote_projects_import_the_remote_machines_agents(
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
     let sidebar = setup_sidebar(&multi_workspace, cx);
 
-    // The window's agent connections, and the agents they were asked to connect.
+    // The window's agent connections, and each connection they were asked for.
     let requested = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
     let connections = cx.update(|_window, cx| {
         let connections = cx.new(|cx| {
             agent_ui::agent_connection_store::AgentConnectionStore::new(project.clone(), cx)
         });
         let requested = requested.clone();
+        let mut connecting = std::collections::HashSet::<&str>::new();
         cx.observe(&connections, move |connections, cx| {
             for agent in ["remote-agent", "other-remote-agent"] {
                 let key = agent_ui::Agent::Custom {
                     id: AgentId::new(agent),
                 };
-                let mut requested = requested.borrow_mut();
-                if connections.read(cx).entry(&key).is_some()
-                    && !requested.iter().any(|name| name == agent)
-                {
-                    requested.push(agent.to_string());
+                if connections.read(cx).entry(&key).is_some() {
+                    if connecting.insert(agent) {
+                        requested.borrow_mut().push(agent.to_string());
+                    }
+                } else {
+                    connecting.remove(agent);
                 }
             }
         })
@@ -16585,5 +16587,65 @@ async fn test_remote_projects_import_the_remote_machines_agents(
         visible_entries_as_strings(&sidebar, cx),
         vec!["v [project]", "  Imported from the remote machine"]
     );
+    drop(connections);
+}
+
+#[gpui::test]
+async fn test_failed_auto_import_connections_are_retried_when_their_backoff_expires(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project("/my-project", cx).await;
+    // A registry agent that isn't in the registry can't connect.
+    cx.update(|cx| {
+        agent_ui::session_auto_import::init(cx);
+        SettingsStore::update_global(cx, |settings_store, cx| {
+            settings_store
+                .set_user_settings(
+                    &serde_json::json!({
+                        "agent_servers": {
+                            "unavailable": {
+                                "type": "registry",
+                                "auto_import_sessions": true
+                            }
+                        }
+                    })
+                    .to_string(),
+                    cx,
+                )
+                .unwrap();
+        });
+    });
+    cx.run_until_parked();
+
+    let requests = std::rc::Rc::new(std::cell::Cell::new(0));
+    let connections = cx.update(|cx| {
+        let connections = cx.new(|cx| {
+            agent_ui::agent_connection_store::AgentConnectionStore::new(project.clone(), cx)
+        });
+        let requests = requests.clone();
+        let mut connecting = false;
+        cx.observe(&connections, move |connections, cx| {
+            let entry = connections.read(cx).entry(&agent_ui::Agent::Custom {
+                id: AgentId::new("unavailable"),
+            });
+            if entry.is_some() && !connecting {
+                requests.set(requests.get() + 1);
+            }
+            connecting = entry.is_some();
+        })
+        .detach();
+        connections
+    });
+    cx.run_until_parked();
+    assert_eq!(requests.get(), 1);
+
+    // Nothing else changes, yet each attempt follows when its backoff expires,
+    // until the importer gives up.
+    for (wait, attempts) in [(29, 1), (1, 2), (60, 3), (15 * 60, 3)] {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(wait));
+        cx.run_until_parked();
+        assert_eq!(requests.get(), attempts, "after another {wait} s");
+    }
     drop(connections);
 }
