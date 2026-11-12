@@ -1140,8 +1140,21 @@ impl ThreadMetadataStore {
 
     pub fn delete(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
         if let Some(thread) = self.threads.get(&thread_id) {
-            if let Some(sid) = &thread.session_id {
-                self.threads_by_session.remove(sid);
+            if let Some(sid) = &thread.session_id
+                && self.threads_by_session.get(sid) == Some(&thread_id)
+            {
+                // Another agent, or the same agent on another machine, may
+                // have a thread with the same session id: it keeps the index.
+                match self.threads.values().find(|other| {
+                    other.thread_id != thread_id && other.session_id.as_ref() == Some(sid)
+                }) {
+                    Some(other) => {
+                        self.threads_by_session.insert(sid.clone(), other.thread_id);
+                    }
+                    None => {
+                        self.threads_by_session.remove(sid);
+                    }
+                }
             }
             if let Some(thread_ids) = self.threads_by_paths.get_mut(thread.folder_paths()) {
                 thread_ids.remove(&thread_id);
@@ -2468,6 +2481,52 @@ mod tests {
             list[0].session_id.as_ref().unwrap().0.as_ref(),
             "existing-session"
         );
+    }
+
+    #[gpui::test]
+    async fn test_deleting_one_of_two_threads_of_a_session_id_keeps_the_other_indexed(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let folder_paths = PathList::new(&[Path::new("/project")]);
+        let here = make_metadata("shared", "Here", Utc::now(), folder_paths.clone());
+        let there = ThreadMetadata {
+            title: Some("There".into()),
+            remote_connection: Some(RemoteConnectionOptions::Wsl(WslConnectionOptions {
+                distro_name: "Ubuntu".to_string(),
+                user: None,
+            })),
+            ..make_metadata("shared", "There", Utc::now(), folder_paths)
+        };
+        let (here_id, there_id) = (here.thread_id, there.thread_id);
+        let indexed = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry_by_session(&acp::SessionId::new("shared"))
+                    .map(|thread| thread.thread_id)
+            })
+        };
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(here, cx);
+                store.save(there, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(indexed(cx), Some(there_id));
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| store.delete(there_id, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(indexed(cx), Some(here_id));
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| store.delete(here_id, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(indexed(cx), None);
     }
 
     #[gpui::test]
