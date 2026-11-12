@@ -2,7 +2,10 @@ use crate::{
     RemoteArch, RemoteClientDelegate, RemoteOs, RemotePlatform,
     command::{RemoteCommand, home_relative_path, home_stdio_launcher_command},
     remote_client::{CommandTemplate, Interactive, RemoteConnection, RemoteConnectionOptions},
-    transport::{HOME_DIR_ARGS, HOME_DIR_PROGRAM, parse_home_dir, parse_platform, parse_shell},
+    transport::{
+        HOME_DIR_ARGS, HOME_DIR_PROGRAM, bundled_server::BundledServer, parse_home_dir,
+        parse_platform, parse_shell,
+    },
 };
 use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
@@ -15,7 +18,7 @@ use futures::{
 use gpui::{App, AppContext as _, AsyncApp, Task};
 use parking_lot::Mutex;
 use paths::remote_server_dir_relative;
-use release_channel::{AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rpc::proto::Envelope;
 use semver::Version;
 pub use settings_content::SshPortForwardOption;
@@ -1017,6 +1020,16 @@ impl SshRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
+        if release_channel == ReleaseChannel::Dev
+            && let Some(commit_sha) = cx.update(|cx| AppCommitSha::try_global(cx))
+            && let Some(bundled) =
+                BundledServer::next_to_current_exe(self.ssh_platform, &commit_sha.full()).await
+        {
+            return self
+                .ensure_bundled_server_binary(&bundled, delegate, cx)
+                .await;
+        }
+
         let version_str = match release_channel {
             ReleaseChannel::Dev => "build".to_string(),
             _ => version.to_string(),
@@ -1140,6 +1153,46 @@ impl SshRemoteConnection {
         self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
             .await
             .context("extracting server binary")?;
+        Ok(dst_path.into())
+    }
+
+    /// Uploads the server that ships with this build, unless the remote machine
+    /// has it already.
+    async fn ensure_bundled_server_binary(
+        &self,
+        bundled: &BundledServer,
+        delegate: &Arc<dyn RemoteClientDelegate>,
+        cx: &mut AsyncApp,
+    ) -> Result<Arc<RelPath>> {
+        let dst_path = remote_server_dir_relative()
+            .join(RelPath::from_unix_str(&bundled.binary_name).context("server name")?);
+        let exists_on_server = self
+            .socket
+            .run_command(
+                self.ssh_shell_kind,
+                &dst_path.display(self.path_style()),
+                &["version"],
+                true,
+            )
+            .await
+            .is_ok();
+        if !exists_on_server {
+            let tmp_path = remote_server_dir_relative().join(
+                RelPath::from_unix_str(&format!(
+                    "{}-download-{}.{}",
+                    bundled.binary_name,
+                    std::process::id(),
+                    bundled.archive_extension()
+                ))
+                .context("server download name")?,
+            );
+            self.upload_local_server_binary(&bundled.archive, &tmp_path, delegate, cx)
+                .await
+                .context("uploading the bundled server binary")?;
+            self.extract_server_binary(&dst_path, &tmp_path, delegate, cx)
+                .await
+                .context("extracting the bundled server binary")?;
+        }
         Ok(dst_path.into())
     }
 
