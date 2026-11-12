@@ -17580,6 +17580,83 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_new_entries_leave_the_time_of_threads_their_agent_times(cx: &mut TestAppContext) {
+        use crate::thread_metadata_store::ThreadMetadata;
+        use chrono::{DateTime, Utc};
+
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        cx.run_until_parked();
+
+        let active = active_thread(&conversation_view, cx);
+        let thread = cx.read(|cx| active.read(cx).thread.clone());
+        let thread_id = conversation_view.read_with(cx, |view, _cx| view.thread_id);
+        let updated_at = |cx: &VisualTestContext| {
+            cx.read(|cx| {
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .expect("the thread's metadata is saved")
+                    .updated_at
+            })
+        };
+        let push = |update: acp_v1::SessionUpdate, cx: &mut VisualTestContext| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(update, cx)
+                    .expect("the update applies");
+            });
+            cx.run_until_parked();
+        };
+
+        // The session's listing reports when the agent last ran it.
+        let listed = DateTime::parse_from_rfc3339("2026-11-07T10:05:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                let metadata = store
+                    .entry(thread_id)
+                    .cloned()
+                    .expect("the thread's metadata is saved");
+                store.set_time_from_agent(thread_id, true);
+                store.save(
+                    ThreadMetadata {
+                        updated_at: listed,
+                        ..metadata
+                    },
+                    cx,
+                );
+            })
+        });
+
+        // An entry the agent replays, or one that catches the thread up with a
+        // turn another app ran, is no activity of the session now.
+        push(
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "Done in another app.".into(),
+            )),
+            cx,
+        );
+        assert_eq!(updated_at(cx), listed);
+
+        // Zed times the threads whose agent doesn't.
+        cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx)
+                .update(cx, |store, _| store.set_time_from_agent(thread_id, false))
+        });
+        push(
+            acp_v1::SessionUpdate::UserMessageChunk(acp_v1::ContentChunk::new("And here?".into())),
+            cx,
+        );
+        assert!(updated_at(cx) > listed);
+    }
+
+    #[gpui::test]
     async fn test_manually_editing_title_updates_acp_thread_title(cx: &mut TestAppContext) {
         use agent_client_protocol::schema::MaybeUndefined;
 

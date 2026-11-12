@@ -506,6 +506,10 @@ pub struct ThreadMetadataStore {
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
+    /// Threads whose agent reports when their sessions were last active, in
+    /// its session list. Zed doesn't stamp them: loading a thread, or entries
+    /// the agent replays into it, would make it look active now.
+    times_from_agent: HashSet<ThreadId>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
     _db_operations_task: Task<()>,
@@ -841,6 +845,16 @@ impl ThreadMetadataStore {
         }
     }
 
+    /// Sets whether the thread's agent reports when its session was last active,
+    /// so that Zed leaves the thread's `updated_at` to it.
+    pub fn set_time_from_agent(&mut self, thread_id: ThreadId, from_agent: bool) {
+        if from_agent {
+            self.times_from_agent.insert(thread_id);
+        } else {
+            self.times_from_agent.remove(&thread_id);
+        }
+    }
+
     pub fn update_interacted_at(
         &mut self,
         thread_id: &ThreadId,
@@ -1169,6 +1183,7 @@ impl ThreadMetadataStore {
             }
         }
         self.threads.remove(&thread_id);
+        self.times_from_agent.remove(&thread_id);
         self.pending_thread_ops_tx
             .try_send(DbOperation::Delete(thread_id))
             .log_err();
@@ -1257,6 +1272,7 @@ impl ThreadMetadataStore {
             threads_by_session: HashMap::default(),
             reload_task: None,
             conversation_subscriptions: HashMap::default(),
+            times_from_agent: HashSet::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
             _db_operations_task,
@@ -1305,7 +1321,10 @@ impl ThreadMetadataStore {
         let title = thread_ref.title();
         let title_override = existing_thread.and_then(|t| t.title_override.clone());
 
-        let updated_at = Utc::now();
+        let updated_at = match existing_thread {
+            Some(existing) if self.times_from_agent.contains(&thread_id) => existing.updated_at,
+            _ => Utc::now(),
+        };
 
         let created_at = existing_thread
             .and_then(|t| t.created_at)

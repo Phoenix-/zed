@@ -7,6 +7,8 @@
 //! agents that don't report changes. Sessions that an agent reports as started by
 //! another session are linked to their parent, so the sidebar can nest them, and
 //! sessions it reports as open in another app are marked, so the sidebar can say so.
+//! A thread is as recent as its agent lists its session: loading the thread in Zed,
+//! or the entries the agent replays into it, don't make it look active now.
 //!
 //! Agents that keep an archive of their own (the Gorynych extension advertised by
 //! `gorynych/archive`) share it with Zed's: a session the agent archives or restores
@@ -826,9 +828,14 @@ impl SessionAutoImport {
         for session_id in &plan.forgotten {
             self.known_sessions.remove(source, session_id);
         }
-        if !plan.save.is_empty() {
-            store.update(cx, |store, cx| store.save_all(plan.save, cx));
-        }
+        store.update(cx, |store, cx| {
+            for (thread_id, from_agent) in plan.times_from_agent {
+                store.set_time_from_agent(thread_id, from_agent);
+            }
+            if !plan.save.is_empty() {
+                store.save_all(plan.save, cx);
+            }
+        });
         for (thread_id, archived) in plan.archive {
             set_thread_archived(thread_id, archived, cx);
         }
@@ -1006,12 +1013,17 @@ impl SessionAutoImport {
         cx: &mut Context<Self>,
     ) {
         self.known_sessions.remove(source, session_id);
-        let open_thread_ids = self.open_thread_ids(cx);
-        let thread_id = agent_threads(ThreadMetadataStore::global(cx).read(cx), source)
+        let store = ThreadMetadataStore::global(cx);
+        let Some(thread_id) = agent_threads(store.read(cx), source)
             .get(session_id)
             .map(|thread| thread.thread_id)
-            .filter(|thread_id| !open_thread_ids.contains(thread_id));
-        if let Some(thread_id) = thread_id {
+        else {
+            return;
+        };
+        if self.open_thread_ids(cx).contains(&thread_id) {
+            // The agent no longer lists the session: Zed times its thread.
+            store.update(cx, |store, _| store.set_time_from_agent(thread_id, false));
+        } else {
             delete_thread(thread_id, cx);
         }
     }
@@ -1138,12 +1150,17 @@ struct SyncPlan {
     archive: Vec<(ThreadId, bool)>,
     /// Sessions to archive or restore in the agent, as the user did.
     send: Vec<(acp::SessionId, bool)>,
+    /// Threads whose agent reports, or no longer reports, when their sessions
+    /// were last active.
+    times_from_agent: Vec<(ThreadId, bool)>,
 }
 
 /// Plans how a listing changes `agent_id`'s threads.
 ///
 /// New sessions become threads, and known threads take the agent's title and
-/// newer activity time. A known session without a thread was deleted in Zed and
+/// activity time. The agent's time wins over a newer one of Zed's: Zed stamps a
+/// thread when it loads it and when the agent replays entries into it, which is
+/// no activity of the session. A known session without a thread was deleted in Zed and
 /// is skipped, and so is a session that a live thread holds before its metadata
 /// names it. When the listing is complete, a session missing from it is
 /// forgotten, and its thread is deleted if this importer created it, unless the
@@ -1193,9 +1210,11 @@ fn plan_sync(
             if known != Some(record) {
                 plan.known.push((session.session_id.clone(), record));
             }
+            plan.times_from_agent
+                .push((existing.thread_id, session.updated_at.is_some()));
             let mut updated = (*existing).clone();
             if let Some(updated_at) = session.updated_at {
-                updated.updated_at = updated.updated_at.max(updated_at);
+                updated.updated_at = updated_at;
             }
             // Open threads get their titles from the live session.
             if session.title.is_some() && !open_thread_ids.contains(&existing.thread_id) {
@@ -1227,8 +1246,11 @@ fn plan_sync(
                 archived: reported_archived,
             },
         ));
+        let thread_id = ThreadId::new();
+        plan.times_from_agent
+            .push((thread_id, session.updated_at.is_some()));
         plan.save.push(ThreadMetadata {
-            thread_id: ThreadId::new(),
+            thread_id,
             session_id: Some(session.session_id),
             agent_id: agent_id.clone(),
             title: session.title,
@@ -1250,12 +1272,14 @@ fn plan_sync(
                 continue;
             }
             plan.forgotten.push(session_id.clone());
-            if let Some(thread) = threads.get(session_id)
-                && known.imported
-                && !thread.archived
-                && !open_thread_ids.contains(&thread.thread_id)
-            {
+            let Some(thread) = threads.get(session_id) else {
+                continue;
+            };
+            if known.imported && !thread.archived && !open_thread_ids.contains(&thread.thread_id) {
                 plan.delete.push(thread.thread_id);
+            } else {
+                // The agent no longer lists the session: Zed times its thread.
+                plan.times_from_agent.push((thread.thread_id, false));
             }
         }
     }
@@ -2932,6 +2956,88 @@ mod tests {
         let complete = plan(true);
         assert_eq!(complete.delete, [thread.thread_id]);
         assert_eq!(complete.forgotten, [session_id]);
+    }
+
+    #[test]
+    fn test_threads_take_the_time_their_agent_lists() {
+        let thread = |session_id: &str| ThreadMetadata {
+            thread_id: ThreadId::new(),
+            session_id: Some(acp::SessionId::new(session_id)),
+            agent_id: AgentId::new("gorynych"),
+            title: None,
+            title_override: None,
+            // Stamped by Zed when it loaded the thread, after the agent last ran it.
+            updated_at: timestamp(30),
+            created_at: None,
+            interacted_at: None,
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[Path::new(
+                "/project",
+            )])),
+            remote_connection: None,
+            archived: false,
+        };
+        let (timed, untimed, gone) = (thread("timed"), thread("untimed"), thread("gone"));
+        let session_ids = ["timed", "untimed", "gone"].map(acp::SessionId::new);
+        let threads = session_ids
+            .iter()
+            .zip([&timed, &untimed, &gone])
+            .collect::<HashMap<_, _>>();
+        let known = session_ids
+            .iter()
+            .map(|session_id| {
+                (
+                    session_id.clone(),
+                    KnownSession {
+                        imported: false,
+                        archived: None,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut untimed_session = session("untimed", "Untimed", "/project", 0);
+        untimed_session.updated_at = None;
+
+        let plan = plan_sync(
+            &AgentId::new("gorynych"),
+            None,
+            SessionListing {
+                sessions: vec![
+                    session("timed", "Timed", "/project", 5),
+                    untimed_session,
+                    session("new", "New", "/project", 7),
+                ],
+                complete: true,
+                archive: false,
+            },
+            &threads,
+            &known,
+            &HashSet::default(),
+            &HashSet::default(),
+            timestamp(40),
+        );
+
+        let saved = |session_id: &str| {
+            plan.save
+                .iter()
+                .find(|thread| thread.session_id == Some(acp::SessionId::new(session_id)))
+                .expect("thread saved")
+        };
+        assert_eq!(saved("timed").updated_at, timestamp(5));
+        assert_eq!(saved("untimed").updated_at, timestamp(30));
+        let new = saved("new");
+        assert_eq!(new.updated_at, timestamp(7));
+        assert_eq!(
+            plan.times_from_agent
+                .iter()
+                .copied()
+                .collect::<HashMap<_, _>>(),
+            HashMap::from_iter([
+                (timed.thread_id, true),
+                (untimed.thread_id, false),
+                (new.thread_id, true),
+                (gone.thread_id, false),
+            ])
+        );
     }
 
     #[test]
