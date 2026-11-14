@@ -43,6 +43,7 @@ pub struct ThreadItem {
     custom_icon_from_external_svg: Option<SharedString>,
     title: SharedString,
     title_slot: Option<AnyElement>,
+    metadata_leading_slot: Option<AnyElement>,
     title_label_color: Option<Color>,
     title_generating: bool,
     highlight_positions: Vec<usize>,
@@ -78,6 +79,7 @@ impl ThreadItem {
             custom_icon_from_external_svg: None,
             title: title.into(),
             title_slot: None,
+            metadata_leading_slot: None,
             title_label_color: None,
             title_generating: false,
             highlight_positions: Vec::new(),
@@ -157,6 +159,12 @@ impl ThreadItem {
 
     pub fn title_slot(mut self, element: impl IntoElement) -> Self {
         self.title_slot = Some(element.into_any_element());
+        self
+    }
+
+    /// Renders an element in the 16px leading cell of the metadata row.
+    pub fn metadata_leading_slot(mut self, element: impl IntoElement) -> Self {
+        self.metadata_leading_slot = Some(element.into_any_element());
         self
     }
 
@@ -406,6 +414,7 @@ impl RenderOnce for ThreadItem {
         let has_project_paths = project_paths.is_some();
         let has_timestamp = !self.timestamp.is_empty();
         let timestamp = self.timestamp;
+        let metadata_leading_slot = self.metadata_leading_slot;
 
         let show_tooltip = matches!(
             self.status,
@@ -495,7 +504,10 @@ impl RenderOnce for ThreadItem {
                 this.child(
                     h_flex()
                         .gap_1p5()
-                        .child(icon_container()) // Icon Spacing
+                        .child(match metadata_leading_slot {
+                            Some(slot) => slot,
+                            None => icon_container().into_any_element(),
+                        })
                         .when(self.archived, |this| {
                             this.child(
                                 Icon::new(IconName::Archive).size(IconSize::XSmall).color(

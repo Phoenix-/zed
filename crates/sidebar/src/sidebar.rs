@@ -2397,7 +2397,7 @@ impl Sidebar {
             ListEntry::Thread(thread) => {
                 let row = self.render_thread(ix, thread, is_active, is_selected, cx);
                 let row = self.render_open_elsewhere_tooltip(ix, &thread.metadata, row, cx);
-                self.render_thread_tree_row(ix, thread.metadata.thread_id, row, cx)
+                self.render_thread_tree_row(thread.metadata.thread_id, row)
             }
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
@@ -6476,6 +6476,45 @@ impl Sidebar {
                 .contains(&thread.metadata.thread_id);
         let open_elsewhere = open_elsewhere::holder(&thread.metadata, cx);
 
+        let thread_tree_disclosure = self
+            .contents
+            .thread_tree
+            .get(&thread.metadata.thread_id)
+            .filter(|tree| tree.child_count > 0 && !is_draft)
+            .map(|tree| {
+                let collapsed = tree.collapsed;
+                h_flex()
+                    .flex_none()
+                    .size_4()
+                    .justify_center()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        IconButton::new(
+                            ("thread-tree-disclosure", ix),
+                            if collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            },
+                        )
+                        .size(ButtonSize::None)
+                        .width(px(16.))
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .hover_background(button_hover_bg)
+                        .active_background(button_active_bg)
+                        .aria_label(if collapsed { "Expand" } else { "Collapse" })
+                        .aria_expanded(!collapsed)
+                        .on_click(cx.listener(
+                            move |this, _, _window, cx| {
+                                cx.stop_propagation();
+                                this.toggle_thread_tree(thread_id_for_actions, cx);
+                            },
+                        )),
+                    )
+                    .into_any_element()
+            });
+
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
             .icon(icon)
@@ -6499,6 +6538,9 @@ impl Sidebar {
                 this.title_label_color(Color::Muted)
             })
             .timestamp(timestamp)
+            .when_some(thread_tree_disclosure, |this, disclosure| {
+                this.metadata_leading_slot(disclosure)
+            })
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
             .notified(has_notification)
