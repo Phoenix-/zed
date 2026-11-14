@@ -15,12 +15,11 @@ use agent_ui::{
 use chrono::{DateTime, Utc};
 use gpui::{AnyElement, App, Context, Pixels, SharedString, px};
 use project::AgentId;
-use ui::{Disclosure, prelude::*};
+use ui::prelude::*;
 
 use crate::{DraftKind, ListEntry, Sidebar};
 
 const INDENT_PER_LEVEL: Pixels = px(12.);
-const DISCLOSURE_WIDTH: Pixels = px(16.);
 const MAX_PARENT_TITLE_LEN: usize = 32;
 
 /// How a thread row sits in its project group's thread tree.
@@ -29,8 +28,7 @@ pub(crate) struct ThreadTreeRow {
     pub depth: usize,
     pub child_count: usize,
     pub collapsed: bool,
-    /// Whether any thread in the group is nested, so that every row in it
-    /// leaves room for a disclosure.
+    /// Whether any thread in the group is nested.
     pub in_tree_group: bool,
     /// For a thread whose parent isn't shown above it.
     pub parent_hint: Option<SharedString>,
@@ -429,10 +427,8 @@ impl Sidebar {
 
     pub(crate) fn render_thread_tree_row(
         &self,
-        ix: usize,
         thread_id: ThreadId,
         row: AnyElement,
-        cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(tree) = self
             .contents
@@ -442,28 +438,10 @@ impl Sidebar {
         else {
             return row;
         };
-        let disclosure = (tree.child_count > 0).then(|| {
-            Disclosure::new(("thread-tree-disclosure", ix), !tree.collapsed).on_click(cx.listener(
-                move |this, _, _window, cx| {
-                    cx.stop_propagation();
-                    this.toggle_thread_tree(thread_id, cx);
-                },
-            ))
-        });
         h_flex()
             .w_full()
             .items_start()
-            .child(
-                // Lines the disclosure up with the row's title rather than its
-                // middle, matching the row's own vertical padding and title height.
-                h_flex()
-                    .flex_none()
-                    .justify_end()
-                    .mt_1()
-                    .h_6()
-                    .w(DISCLOSURE_WIDTH + INDENT_PER_LEVEL * tree.depth as f32)
-                    .children(disclosure),
-            )
+            .pl(INDENT_PER_LEVEL * tree.depth as f32)
             .child(div().flex_1().min_w_0().child(row))
             .into_any_element()
     }
