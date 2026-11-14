@@ -5115,6 +5115,273 @@ pub(crate) mod tests {
         );
     }
 
+    #[gpui::test(iterations = 10)]
+    async fn test_external_steering_does_not_cancel_or_start_another_turn(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_steering();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let view = active_thread(&conversation_view, cx);
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx)
+        });
+        view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        connection.take_cancel_calls();
+        let response = connection.defer_next_steering_response();
+        view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["steer".into()], vec![], window, cx);
+            let id = view.message_queue.first_id().expect("queued message");
+            view.toggle_queue_entry_steer(id, window, cx);
+            assert!(view.message_queue.try_fast_track(true).is_none());
+            assert!(view.message_queue.remove(id).is_none());
+            assert!(view.message_queue.send_now(id, true).is_none());
+            view.message_queue.clear();
+            assert_eq!(view.message_queue.len(), 1);
+        });
+        cx.run_until_parked();
+        assert_eq!(connection.steering_calls().len(), 1);
+        assert!(connection.take_cancel_calls().is_empty());
+        response
+            .send(Ok(acp_thread::SteeringOutcome::Injected))
+            .expect("steering waiter");
+        cx.run_until_parked();
+        let session_id = view.read_with(cx, |view, cx| {
+            assert!(view.message_queue.is_empty());
+            let thread = view.thread.read(cx);
+            assert_eq!(thread.status(), ThreadStatus::Generating);
+            assert_eq!(
+                thread
+                    .entries()
+                    .iter()
+                    .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    .count(),
+                2
+            );
+            thread.session_id().clone()
+        });
+        assert!(connection.take_cancel_calls().is_empty());
+        cx.update(|_, _| connection.end_turn(session_id, acp_v1::StopReason::EndTurn));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test(iterations = 10)]
+    async fn test_external_steering_turn_end_waits_for_the_reserved_message(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_steering();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let view = active_thread(&conversation_view, cx);
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx)
+        });
+        view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let response = connection.defer_next_steering_response();
+        view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["ordinary".into()], vec![], window, cx);
+            view.add_to_queue(vec!["fallback".into()], vec![], window, cx);
+            let id = view.message_queue.last_id().expect("queued message");
+            view.toggle_queue_entry_steer(id, window, cx);
+        });
+        cx.run_until_parked();
+        let session_id = view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        cx.update(|_, _| connection.end_turn(session_id.clone(), acp_v1::StopReason::EndTurn));
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.send_queued_message_after_generation_stopped(false, window, cx));
+            assert_eq!(view.message_queue.len(), 2);
+        });
+        response
+            .send(Ok(acp_thread::SteeringOutcome::PromptRequired))
+            .expect("steering waiter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.message_queue.len(), 1);
+            assert_eq!(
+                view.message_queue
+                    .first()
+                    .expect("ordinary queued input")
+                    .content,
+                vec![acp_v2::ContentBlock::from("ordinary")]
+            );
+            let thread = view.thread.read(cx);
+            assert_eq!(thread.status(), ThreadStatus::Generating);
+            assert_eq!(
+                thread
+                    .entries()
+                    .iter()
+                    .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    .count(),
+                2
+            );
+        });
+        assert_eq!(connection.steering_calls().len(), 1);
+        cx.update(|_, _| connection.end_turn(session_id.clone(), acp_v1::StopReason::EndTurn));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.message_queue.is_empty()));
+        cx.update(|_, _| connection.end_turn(session_id, acp_v1::StopReason::EndTurn));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test(iterations = 10)]
+    async fn test_external_steering_late_acceptance_does_not_start_another_turn(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_steering();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let view = active_thread(&conversation_view, cx);
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx)
+        });
+        view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let response = connection.defer_next_steering_response();
+        view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["late accepted".into()], vec![], window, cx);
+            let id = view.message_queue.first_id().expect("queued message");
+            view.toggle_queue_entry_steer(id, window, cx);
+        });
+        cx.run_until_parked();
+        let session_id = view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        cx.update(|_, _| connection.end_turn(session_id, acp_v1::StopReason::EndTurn));
+        cx.run_until_parked();
+        connection.take_cancel_calls();
+        response
+            .send(Ok(acp_thread::SteeringOutcome::Injected))
+            .expect("steering waiter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.message_queue.is_empty());
+            let thread = view.thread.read(cx);
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            assert_eq!(
+                thread
+                    .entries()
+                    .iter()
+                    .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    .count(),
+                2
+            );
+        });
+        assert!(connection.take_cancel_calls().is_empty());
+        assert_eq!(connection.steering_calls().len(), 1);
+    }
+
+    #[gpui::test(iterations = 10)]
+    async fn test_external_steering_refusal_restores_ordinary_delivery(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_steering();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let view = active_thread(&conversation_view, cx);
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx)
+        });
+        view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        connection.take_cancel_calls();
+        let response = connection.defer_next_steering_response();
+        view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["refused".into()], vec![], window, cx);
+            let id = view.message_queue.first_id().expect("queued message");
+            view.toggle_queue_entry_steer(id, window, cx);
+        });
+        cx.run_until_parked();
+        response
+            .send(Err(acp_thread::SteeringError::Refused(anyhow::anyhow!(
+                "not supported"
+            ))))
+            .expect("steering waiter");
+        cx.run_until_parked();
+        let session_id = view.read_with(cx, |view, cx| {
+            let entry = view.message_queue.first().expect("refused input retained");
+            assert_eq!(entry.delivery, QueueEntryDelivery::Queued);
+            assert!(!entry.steer);
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+            view.thread.read(cx).session_id().clone()
+        });
+        assert!(connection.take_cancel_calls().is_empty());
+        cx.update(|_, _| connection.end_turn(session_id.clone(), acp_v1::StopReason::EndTurn));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.message_queue.is_empty());
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+        });
+        cx.update(|_, _| connection.end_turn(session_id, acp_v1::StopReason::EndTurn));
+        cx.run_until_parked();
+        assert_eq!(connection.steering_calls().len(), 1);
+    }
+
+    #[gpui::test(iterations = 10)]
+    async fn test_external_steering_unknown_delivery_is_preserved_outside_automatic_queue(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_steering();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let view = active_thread(&conversation_view, cx);
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx)
+        });
+        view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let response = connection.defer_next_steering_response();
+        view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["uncertain".into()], vec![], window, cx);
+            let id = view.message_queue.first_id().expect("queued message");
+            view.toggle_queue_entry_steer(id, window, cx);
+        });
+        cx.run_until_parked();
+        drop(response);
+        cx.run_until_parked();
+        let session_id = view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        cx.update(|_, _| connection.end_turn(session_id.clone(), acp_v1::StopReason::EndTurn));
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            view.message_queue.resume();
+            assert!(!view.send_queued_message_after_generation_stopped(false, window, cx));
+            assert!(view.message_queue.try_fast_track(false).is_none());
+            assert_eq!(
+                view.message_queue.first().expect("retained text").delivery,
+                QueueEntryDelivery::Unknown
+            );
+            let recovery = view.snapshot_recovery(cx).expect("recoverable input");
+            let saved: serde_json::Value = serde_json::from_str(
+                &thread_view::ThreadRecovery::to_json(Some(&session_id), Some(&recovery), &[])
+                    .expect("saved input"),
+            )
+            .expect("JSON");
+            assert_eq!(saved["queued"].as_array().expect("ordinary queue").len(), 0);
+            assert_eq!(
+                saved["uncertain_steering"]
+                    .as_array()
+                    .expect("uncertain input")
+                    .len(),
+                1
+            );
+            view.message_queue.clear();
+            view.restore_recovery(&recovery, window, cx);
+            view.message_queue.resume();
+            assert_eq!(
+                view.message_queue.first().expect("restored input").delivery,
+                QueueEntryDelivery::Unknown
+            );
+            assert!(!view.send_queued_message_after_generation_stopped(false, window, cx));
+        });
+        assert_eq!(connection.steering_calls().len(), 1);
+    }
+
     #[gpui::test]
     async fn test_queued_message_steer_defaults_off_and_toggles(cx: &mut TestAppContext) {
         init_test(cx);

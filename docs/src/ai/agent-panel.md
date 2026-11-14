@@ -64,7 +64,9 @@ You can click on the card that contains your message and re-submit it with an ad
 
 Messages sent while the agent is in the generating state get, by default, queued.
 
-By default, queued messages get sent once the agent finishes generating. If you want a queued message to reach the Zed Agent sooner—interrupting it at its next step (usually between a tool call and a response) rather than waiting for it to finish—toggle "Steer" on that message. Steering is only available for the Zed Agent, since Zed can't detect turn boundaries for external agents.
+By default, queued messages get sent once the agent finishes generating. Toggle "Steer" on a queued message to send it sooner. The Zed Agent takes it at its next step boundary. External ACP agents that support steering receive it while their current turn continues. The toggle is hidden when the agent or session does not support steering.
+
+An external agent can decline steering, leaving the message queued for the end of the turn. If delivery cannot be confirmed, the message stays visible with a delivery-unknown warning and is excluded from automatic sending. It is also preserved separately from ordinary queued input when recovering a failed connection. Steering leaves pending approvals and questions unanswered.
 
 You can edit or remove (an individual or all) queued messages.
 You can also still interrupt the agent immediately if you want by either clicking on the stop button or by clicking the "Send Now" (double-enter) on a queued message.

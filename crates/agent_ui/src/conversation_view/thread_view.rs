@@ -114,6 +114,7 @@ pub(super) struct ThreadRecovery {
 struct QueuedMessageRecovery {
     content: Vec<acp_v2::ContentBlock>,
     tracked_buffers: Vec<Entity<Buffer>>,
+    delivery_unknown: bool,
 }
 
 pub(super) struct SavedSubmission {
@@ -132,6 +133,8 @@ impl ThreadRecovery {
             session_id: Option<&'a acp_v2::SessionId>,
             draft: &'a [acp_v2::ContentBlock],
             queued: Vec<&'a [acp_v2::ContentBlock]>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            uncertain_steering: Vec<&'a [acp_v2::ContentBlock]>,
             submissions: Vec<(&'a [acp_v2::ContentBlock], &'a SubmissionState)>,
         }
 
@@ -141,6 +144,13 @@ impl ThreadRecovery {
             queued: recovery
                 .into_iter()
                 .flat_map(|recovery| &recovery.queued)
+                .filter(|queued| !queued.delivery_unknown)
+                .map(|queued| queued.content.as_slice())
+                .collect(),
+            uncertain_steering: recovery
+                .into_iter()
+                .flat_map(|recovery| &recovery.queued)
+                .filter(|queued| queued.delivery_unknown)
                 .map(|queued| queued.content.as_slice())
                 .collect(),
             submissions: saved_submissions
@@ -978,7 +988,13 @@ pub fn open_markdown_in_workspace(
 impl ThreadView {
     pub(super) fn snapshot_recovery(&self, cx: &App) -> Option<ThreadRecovery> {
         let thread = self.thread.read(cx);
-        if !thread.uses_reported_activity() || !thread.is_observation_closed() {
+        let has_unresolved_steering = self
+            .message_queue
+            .iter()
+            .any(|entry| entry.delivery != QueueEntryDelivery::Queued);
+        if !has_unresolved_steering
+            && (!thread.uses_reported_activity() || !thread.is_observation_closed())
+        {
             return None;
         }
         let editor = self.message_editor.read(cx);
@@ -1014,6 +1030,7 @@ impl ThreadView {
                             editor.draft_content_blocks_snapshot(cx)
                         },
                         tracked_buffers: entry.tracked_buffers.clone(),
+                        delivery_unknown: entry.delivery != QueueEntryDelivery::Queued,
                     }
                 })
                 .collect(),
@@ -1033,6 +1050,12 @@ impl ThreadView {
                 window,
                 cx,
             );
+            if queued.delivery_unknown
+                && let Some(id) = self.message_queue.last_id()
+                && let Some(entry) = self.message_queue.entry_by_id_mut(id)
+            {
+                entry.delivery = QueueEntryDelivery::Unknown;
+            }
         }
         self.message_queue.pause();
     }
@@ -2980,6 +3003,7 @@ impl ThreadView {
             content,
             tracked_buffers,
             steer,
+            delivery: QueueEntryDelivery::Queued,
             editor,
             _subscription: subscription,
         }
@@ -3022,6 +3046,9 @@ impl ThreadView {
         let Some(entry) = self.message_queue.entry_by_id(id) else {
             return;
         };
+        if entry.delivery != QueueEntryDelivery::Queued {
+            return;
+        }
         if !entry
             .content
             .iter()
@@ -3038,6 +3065,9 @@ impl ThreadView {
 
             this.update(cx, |this, cx| {
                 if let Some(entry) = this.message_queue.entry_by_id_mut(id) {
+                    if entry.delivery != QueueEntryDelivery::Queued {
+                        return;
+                    }
                     if !entry
                         .content
                         .iter()
@@ -3068,10 +3098,93 @@ impl ThreadView {
         removed
     }
 
-    fn toggle_queue_entry_steer(&mut self, id: QueueEntryId, cx: &mut Context<Self>) {
+    pub(super) fn toggle_queue_entry_steer(
+        &mut self,
+        id: QueueEntryId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.message_queue.toggle_steer(id);
         self.sync_queue_flag_to_native_thread(cx);
+        self.steer_queued_message(window, cx);
         cx.notify();
+    }
+
+    fn can_steer(&self, cx: &App) -> bool {
+        !self.is_read_only(cx)
+            && (self.as_native_thread(cx).is_some() || {
+                let thread = self.thread.read(cx);
+                thread
+                    .connection()
+                    .supports_steering(thread.session_id(), cx)
+            })
+    }
+
+    fn steer_queued_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.as_native_thread(cx).is_some()
+            || self.is_loading_contents
+            || self.is_read_only(cx)
+            || self.thread.read(cx).status() != ThreadStatus::Generating
+        {
+            return;
+        }
+        let thread = self.thread.read(cx);
+        let connection = thread.connection().clone();
+        let session_id = thread.session_id().clone();
+        if !connection.supports_steering(&session_id, cx) {
+            return;
+        }
+        let Some(id) = self.message_queue.begin_steering() else {
+            return;
+        };
+        let Some(entry) = self.message_queue.entry_by_id(id) else {
+            return;
+        };
+        let content = entry.content.clone();
+        let request = connection.steer(
+            &session_id,
+            content,
+            uuid::Uuid::new_v4().to_string().into(),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let response = request.await;
+            this.update_in(cx, |this, window, cx| {
+                match response {
+                    Ok(acp_thread::SteeringOutcome::Injected) => {
+                        this.message_queue
+                            .finish_steering(id, QueueEntryDelivery::Queued);
+                        if let Some(entry) = this.message_queue.remove(id) {
+                            this.thread.update(cx, |thread, cx| {
+                                thread.append_steered_user_message(entry.content, cx)
+                            });
+                        }
+                    }
+                    Ok(acp_thread::SteeringOutcome::PromptRequired) => {
+                        this.message_queue.require_prompt(id);
+                    }
+                    Err(error @ acp_thread::SteeringError::Refused(_)) => {
+                        this.message_queue
+                            .finish_steering(id, QueueEntryDelivery::Queued);
+                        this.handle_thread_error(anyhow::Error::new(error), cx);
+                    }
+                    Err(error @ acp_thread::SteeringError::DeliveryUnknown(_)) => {
+                        this.message_queue
+                            .finish_steering(id, QueueEntryDelivery::Unknown);
+                        this.handle_thread_error(anyhow::Error::new(error), cx);
+                    }
+                }
+                let editor_focused = this
+                    .message_queue
+                    .first()
+                    .is_some_and(|entry| entry.editor.focus_handle(cx).is_focused(window));
+                this.send_queued_message_after_generation_stopped(editor_focused, window, cx);
+                this.steer_queued_message(window, cx);
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     pub fn sync_queue_flag_to_native_thread(&self, cx: &mut Context<Self>) {
@@ -4871,6 +4984,7 @@ impl ThreadView {
             )
             .child(
                 Button::new("clear_queue", "Clear All")
+                    .disabled(self.message_queue.is_steering())
                     .label_size(LabelSize::Small)
                     .key_binding(
                         KeyBinding::for_action(&ClearMessageQueue, cx)
@@ -5749,8 +5863,8 @@ impl ThreadView {
                     cx,
                 )
             })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_queue_entry_steer(entry_id, cx);
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle_queue_entry_steer(entry_id, window, cx);
             }))
     }
 
@@ -5764,7 +5878,7 @@ impl ThreadView {
 
         let queue_len = self.message_queue.len();
         let can_fast_track = self.message_queue.can_fast_track();
-        let is_native = self.as_native_thread(cx).is_some();
+        let can_steer = self.can_steer(cx);
 
         v_flex()
             .id("message_queue_list")
@@ -5783,6 +5897,9 @@ impl ThreadView {
                 let editor_focused = editor.focus_handle(cx).is_focused(_window);
                 let keybinding_size = rems_from_px(12_f32);
                 let steer_on = entry.steer;
+                let delivery_blocked = entry.delivery != QueueEntryDelivery::Queued;
+                let steering_pending = entry.delivery == QueueEntryDelivery::Steering;
+                let send_blocked = delivery_blocked || self.message_queue.is_steering();
 
                 h_flex()
                     .group("queue_entry")
@@ -5812,6 +5929,17 @@ impl ThreadView {
                             .min_w(rems_from_px(120_f32))
                             .child(editor.clone()),
                     )
+                    .when(delivery_blocked, |row| {
+                        row.child(
+                            Label::new(if entry.delivery == QueueEntryDelivery::Steering {
+                                "Sending steering message…"
+                            } else {
+                                "Delivery unknown — not sent again automatically"
+                            })
+                            .size(LabelSize::Small)
+                            .color(Color::Warning),
+                        )
+                    })
                     .child(if editor_focused {
                         h_flex()
                             .gap_1()
@@ -5819,6 +5947,7 @@ impl ThreadView {
                             .justify_end()
                             .child(
                                 IconButton::new(("edit", index), IconName::Pencil)
+                                    .disabled(steering_pending)
                                     .icon_size(IconSize::Small)
                                     .tooltip(|_window, cx| {
                                         Tooltip::with_meta(
@@ -5834,13 +5963,14 @@ impl ThreadView {
                                         );
                                     })),
                             )
-                            .when(is_native, |row| {
+                            .when(can_steer && !delivery_blocked, |row| {
                                 row.child(self.render_queue_steer_button(
                                     entry_id, index, is_next, steer_on, cx,
                                 ))
                             })
                             .child(
                                 Button::new(("send_now_focused", index), "Send Now")
+                                    .disabled(send_blocked)
                                     .label_size(LabelSize::Small)
                                     .style(ButtonStyle::Outlined)
                                     .key_binding(
@@ -5863,6 +5993,7 @@ impl ThreadView {
                             .justify_end()
                             .child(
                                 IconButton::new(("delete", index), IconName::Trash)
+                                    .disabled(steering_pending)
                                     .icon_size(IconSize::Small)
                                     .tooltip({
                                         let focus_handle = focus_handle.clone();
@@ -5886,6 +6017,7 @@ impl ThreadView {
                             )
                             .child(
                                 IconButton::new(("edit", index), IconName::Pencil)
+                                    .disabled(steering_pending)
                                     .icon_size(IconSize::Small)
                                     .tooltip({
                                         let focus_handle = focus_handle.clone();
@@ -5908,13 +6040,14 @@ impl ThreadView {
                                         );
                                     })),
                             )
-                            .when(is_native, |row| {
+                            .when(can_steer && !delivery_blocked, |row| {
                                 row.child(self.render_queue_steer_button(
                                     entry_id, index, is_next, steer_on, cx,
                                 ))
                             })
                             .child(
                                 Button::new(("send_now", index), "Send Now")
+                                    .disabled(send_blocked)
                                     .label_size(LabelSize::Small)
                                     .when(is_next, |this| this.style(ButtonStyle::Outlined))
                                     .when(is_next && message_editor.is_empty(cx), |this| {
@@ -14004,12 +14137,12 @@ impl Render for ThreadView {
                 }
             }))
             .on_action(
-                cx.listener(|this, _: &ToggleSteerFirstQueuedMessage, _, cx| {
-                    if this.as_native_thread(cx).is_none() {
+                cx.listener(|this, _: &ToggleSteerFirstQueuedMessage, window, cx| {
+                    if !this.can_steer(cx) {
                         return;
                     }
                     if let Some(id) = this.message_queue.first_id() {
-                        this.toggle_queue_entry_steer(id, cx);
+                        this.toggle_queue_entry_steer(id, window, cx);
                     }
                 }),
             )

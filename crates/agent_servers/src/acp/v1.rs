@@ -8,7 +8,7 @@ use super::{
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
-    AgentSessionListResponse, ElicitationStore,
+    AgentSessionListResponse, ElicitationStore, SteeringError, SteeringOutcome,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::{
@@ -86,6 +86,8 @@ pub struct AcpConnection {
     auth_methods: Vec<acp_v2::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
+    steering_supported: bool,
+    session_steering: RefCell<HashMap<acp_v2::SessionId, bool>>,
     /// Whether Zed advertised the subagents RFD, so the agent reports subagents with it.
     accepts_subagent_updates: bool,
     request_elicitations: Entity<ElicitationStore>,
@@ -191,6 +193,68 @@ struct SessionConfigResponse {
     interactivity: SessionInteractivity,
     /// The extension's current activity snapshot reported with the response.
     session_state: Option<acp_thread::SessionStateSnapshot>,
+    steering: Option<bool>,
+}
+
+fn steering_session_override(meta: Option<&acp::Meta>) -> Option<bool> {
+    meta?
+        .get("gorynych/steering")
+        .map(|value| value.as_bool().unwrap_or(false))
+}
+
+fn steering_advertised(meta: Option<&acp::Meta>) -> bool {
+    meta.and_then(|meta| meta.get("steering"))
+        .and_then(|steering| steering.get("supported"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+fn steering_request(
+    session_id: &acp_v2::SessionId,
+    content: Vec<acp_v2::ContentBlock>,
+    prompt_id: &str,
+) -> Result<UntypedMessage> {
+    let request =
+        acp_thread::content::prompt_to_v1(acp_v2::PromptRequest::new(session_id.clone(), content))?;
+    let mut params = serde_json::to_value(request)?;
+    params["_meta"] = serde_json::json!({
+        "steering": { "idleBehavior": "promptRequired" },
+        "gorynych/promptId": prompt_id,
+    });
+    Ok(UntypedMessage {
+        method: "_session/steering".into(),
+        params,
+    })
+}
+
+fn steering_response(
+    response: Result<serde_json::Value, agent_client_protocol::Error>,
+) -> Result<SteeringOutcome, SteeringError> {
+    match response {
+        Ok(response) => match response.get("outcome").and_then(serde_json::Value::as_str) {
+            Some("injected" | "startedNewTurn") => Ok(SteeringOutcome::Injected),
+            Some("promptRequired" | "noActiveTurn") => Ok(SteeringOutcome::PromptRequired),
+            _ => Err(SteeringError::DeliveryUnknown(anyhow!(
+                "The agent returned an unrecognized steering outcome"
+            ))),
+        },
+        Err(error) => {
+            let refused = matches!(
+                error.code,
+                ErrorCode::MethodNotFound | ErrorCode::InvalidParams
+            ) || (error.code == ErrorCode::InvalidRequest
+                && error.data.as_ref().is_some_and(|data| {
+                    data.get("gorynych/steerRefused")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|reason| matches!(reason, "notSupported" | "turnNotSteerable"))
+                }));
+            if refused {
+                Err(SteeringError::Refused(error.into()))
+            } else {
+                Err(SteeringError::DeliveryUnknown(error.into()))
+            }
+        }
+    }
 }
 
 /// Sends `request` and returns its response. Once the response arrives, the agent's later
@@ -734,6 +798,7 @@ impl AcpConnection {
             return Err(UnsupportedVersion.into());
         }
 
+        let steering_supported = steering_advertised(response.meta.as_ref());
         let reports_session_state = session_state::advertises(&response.agent_capabilities);
         session_state
             .borrow_mut()
@@ -826,6 +891,8 @@ impl AcpConnection {
             sessions,
             pending_sessions: RefCell::new(HashMap::default()),
             agent_capabilities: response.agent_capabilities,
+            steering_supported,
+            session_steering: RefCell::new(HashMap::default()),
             accepts_subagent_updates,
             request_elicitations,
             defaults,
@@ -875,6 +942,8 @@ impl AcpConnection {
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
+            steering_supported: false,
+            session_steering: RefCell::new(HashMap::default()),
             accepts_subagent_updates,
             request_elicitations,
             defaults,
@@ -942,6 +1011,7 @@ impl AcpConnection {
             .is_some_and(|session| session.thread.entity_id() == thread_id)
         {
             sessions.remove(session_id);
+            self.session_steering.borrow_mut().remove(session_id);
         }
     }
 
@@ -1143,6 +1213,10 @@ impl AcpConnection {
                         .as_ref()
                         .ok()
                         .and_then(|response| response.session_state.clone());
+                    let response_steering = response
+                        .as_ref()
+                        .ok()
+                        .and_then(|response| response.steering);
                     let (modes, config_options) = match response
                         .and_then(|response| config_state(response.modes, response.config_options))
                     {
@@ -1170,6 +1244,10 @@ impl AcpConnection {
                             };
                             session.session_modes = modes;
                             session.config_options = config_options;
+                            connection_state.session_steering.borrow_mut().insert(
+                                session_id.clone(),
+                                response_steering.unwrap_or(connection_state.steering_supported),
+                            );
                         }
                         loaded_thread
                             .update(cx, |thread, cx| thread.set_interactivity(interactivity, cx));
@@ -1521,6 +1599,7 @@ impl AgentConnection for AcpConnection {
 
             let response_session_state =
                 acp_thread::SessionStateSnapshot::from_meta(response.meta.as_ref());
+            let response_steering = steering_session_override(response.meta.as_ref());
             let (modes, config_options) = config_state(response.modes, response.config_options)?;
 
             let default_mode = self.defaults.mode();
@@ -1618,6 +1697,9 @@ impl AgentConnection for AcpConnection {
             }
 
             cx.update(|cx| {
+                self.session_steering.borrow_mut().insert(
+                    session_id.clone(), response_steering.unwrap_or(self.steering_supported)
+                );
                 self.register_session(
                     session_id,
                     &thread,
@@ -1687,6 +1769,7 @@ impl AgentConnection for AcpConnection {
                     )
                     .await?;
                     Ok(SessionConfigResponse {
+                        steering: steering_session_override(response.meta.as_ref()),
                         modes: response.modes,
                         config_options: response.config_options,
                         interactivity: interactivity_from_meta(response.meta.as_ref())
@@ -1736,6 +1819,7 @@ impl AgentConnection for AcpConnection {
                     )
                     .await?;
                     Ok(SessionConfigResponse {
+                        steering: steering_session_override(response.meta.as_ref()),
                         modes: response.modes,
                         config_options: response.config_options,
                         interactivity: interactivity_from_meta(response.meta.as_ref())
@@ -1817,6 +1901,41 @@ impl AgentConnection for AcpConnection {
 
     fn validate_prompt_content(&self, content: &[acp_v2::ContentBlock]) -> Result<()> {
         acp_thread::content::validate_prompt_content_for_v1(content)
+    }
+
+    fn supports_steering(&self, session_id: &acp_v2::SessionId, _cx: &App) -> bool {
+        self.sessions
+            .borrow()
+            .get(session_id)
+            .is_some_and(|session| !session.is_subagent)
+            && self
+                .session_steering
+                .borrow()
+                .get(session_id)
+                .copied()
+                .unwrap_or(self.steering_supported)
+    }
+
+    fn steer(
+        &self,
+        session_id: &acp_v2::SessionId,
+        content: Vec<acp_v2::ContentBlock>,
+        prompt_id: SharedString,
+        cx: &App,
+    ) -> Task<Result<SteeringOutcome, SteeringError>> {
+        if !self.supports_steering(session_id, cx) {
+            return Task::ready(Err(SteeringError::Refused(anyhow!(
+                "This session does not support steering"
+            ))));
+        }
+        let request = match steering_request(session_id, content, prompt_id.as_ref()) {
+            Ok(request) => request,
+            Err(error) => return Task::ready(Err(SteeringError::Refused(error))),
+        };
+        let connection = self.connection.clone();
+        cx.foreground_executor().spawn(async move {
+            steering_response(connection.send_request(request).block_task().await)
+        })
     }
 
     fn prompt(
@@ -2588,8 +2707,224 @@ mod tests {
 
     use super::super::*;
     use super::*;
+
+    #[test]
+    fn steering_requires_explicit_connection_support_and_honors_session_override() {
+        let supported = serde_json::from_value::<acp::Meta>(
+            serde_json::json!({"steering": {"supported": true}}),
+        )
+        .expect("metadata");
+        assert!(steering_advertised(Some(&supported)));
+        assert!(!steering_advertised(None));
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"steering": {"supported": false}}),
+            serde_json::json!({"steering": {"supported": "true"}}),
+        ] {
+            let meta = serde_json::from_value::<acp::Meta>(value).expect("metadata");
+            assert!(!steering_advertised(Some(&meta)));
+        }
+        assert_eq!(steering_session_override(None), None);
+        for enabled in [true, false] {
+            let meta = serde_json::from_value::<acp::Meta>(
+                serde_json::json!({"gorynych/steering": enabled}),
+            )
+            .expect("session metadata");
+            assert_eq!(steering_session_override(Some(&meta)), Some(enabled));
+        }
+    }
+
+    #[test]
+    fn steering_wire_preserves_content_and_requires_a_prompt_when_idle() {
+        let request = steering_request(
+            &acp_v2::SessionId::new("session"),
+            vec!["follow up".into()],
+            "correlation",
+        )
+        .expect("request");
+        assert_eq!(request.method, "_session/steering");
+        assert_eq!(
+            request.params,
+            serde_json::json!({
+                "sessionId": "session", "prompt": [{"type": "text", "text": "follow up"}],
+                "_meta": {"steering": {"idleBehavior": "promptRequired"}, "gorynych/promptId": "correlation"}
+            })
+        );
+    }
+
+    #[test]
+    fn steering_unknown_results_and_transport_failures_never_confirm_non_delivery() {
+        for outcome in ["injected", "startedNewTurn"] {
+            assert_eq!(
+                steering_response(Ok(serde_json::json!({"outcome": outcome}))).expect("accepted"),
+                SteeringOutcome::Injected
+            );
+        }
+        for outcome in ["promptRequired", "noActiveTurn"] {
+            assert_eq!(
+                steering_response(Ok(serde_json::json!({"outcome": outcome}))).expect("idle"),
+                SteeringOutcome::PromptRequired
+            );
+        }
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"outcome": "failed"}),
+            serde_json::json!({"outcome": false}),
+        ] {
+            assert!(matches!(
+                steering_response(Ok(response)),
+                Err(SteeringError::DeliveryUnknown(_))
+            ));
+        }
+        for code in [-32603, -32000, -32600] {
+            assert!(matches!(
+                steering_response(Err(agent_client_protocol::Error::new(code, "unknown"))),
+                Err(SteeringError::DeliveryUnknown(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn steering_only_verified_refusals_allow_ordinary_queue_delivery() {
+        for code in [-32601, -32602] {
+            assert!(matches!(
+                steering_response(Err(agent_client_protocol::Error::new(code, "refused"))),
+                Err(SteeringError::Refused(_))
+            ));
+        }
+        for reason in ["notSupported", "turnNotSteerable"] {
+            assert!(matches!(
+                steering_response(Err(agent_client_protocol::Error::new(-32600, "refused")
+                    .data(serde_json::json!({"gorynych/steerRefused": reason})))),
+                Err(SteeringError::Refused(_))
+            ));
+        }
+        assert!(matches!(
+            steering_response(Err(agent_client_protocol::Error::new(-32600, "unknown")
+                .data(serde_json::json!({"gorynych/steerRefused": "future"})))),
+            Err(SteeringError::DeliveryUnknown(_))
+        ));
+    }
     use futures::StreamExt as _;
     use settings::Settings as _;
+
+    #[gpui::test(iterations = 10)]
+    async fn steering_uses_the_sdk_transport_and_session_capability(cx: &mut gpui::TestAppContext) {
+        init_settings_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({"a": {}})).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let mut harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let (request_sender, request_receiver) = futures::channel::oneshot::channel();
+        let request_sender = Arc::new(Mutex::new(Some(request_sender)));
+        let _agent_io_task = cx.background_spawn(
+            Agent
+                .builder()
+                .name("steering-test-agent")
+                .on_receive_request(
+                    async move |_request: acp::NewSessionRequest, responder, _cx| {
+                        let mut response = acp::NewSessionResponse::new("steering-session");
+                        response.meta = Some(
+                            serde_json::from_value(serde_json::json!({"gorynych/steering": true}))
+                                .expect("session metadata"),
+                        );
+                        responder.respond(response)
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: UntypedMessage, responder, _cx| {
+                        request_sender
+                            .lock()
+                            .expect("sender lock")
+                            .take()
+                            .expect("one steering request")
+                            .send(request)
+                            .expect("request observer");
+                        responder.respond(serde_json::json!({"outcome": "injected"}))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_transport),
+        );
+        let (connection_sender, connection_receiver) = futures::channel::oneshot::channel();
+        let _client_io_task = cx.background_spawn(connect_client_future(
+            "steering-test-client",
+            client_transport,
+            harness.connection.dispatch_tx.clone(),
+            connection_sender,
+            futures::future::pending(),
+        ));
+        Rc::get_mut(&mut harness.connection)
+            .expect("sole connection owner")
+            .connection = connection_receiver.await.expect("SDK connection");
+        assert!(!harness.connection.steering_supported);
+        let thread = cx
+            .update(|cx| {
+                harness.connection.clone().new_session(
+                    project,
+                    PathList::new(&[std::path::PathBuf::from("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .expect("new session");
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        assert!(cx.update(|cx| harness.connection.supports_steering(&session_id, cx)));
+        assert!(!cx.update(|cx| {
+            harness
+                .connection
+                .supports_steering(&acp_v2::SessionId::new("unknown"), cx)
+        }));
+        let result = cx
+            .update(|cx| {
+                harness.connection.steer(
+                    &session_id,
+                    vec!["wire follow up".into()],
+                    "correlation".into(),
+                    cx,
+                )
+            })
+            .await
+            .expect("accepted steering");
+        assert_eq!(result, SteeringOutcome::Injected);
+        let request = request_receiver.await.expect("observed SDK request");
+        assert_eq!(request.method, "_session/steering");
+        assert_eq!(request.params["sessionId"], "steering-session");
+        assert_eq!(request.params["prompt"][0]["text"], "wire follow up");
+        assert_eq!(
+            request.params["_meta"]["steering"]["idleBehavior"],
+            "promptRequired"
+        );
+        assert_eq!(request.params["_meta"]["gorynych/promptId"], "correlation");
+        harness
+            .connection
+            .session_steering
+            .borrow_mut()
+            .insert(session_id.clone(), false);
+        assert!(!cx.update(|cx| harness.connection.supports_steering(&session_id, cx)));
+        assert!(matches!(
+            cx.update(|cx| harness.connection.steer(
+                &session_id,
+                vec!["must not send".into()],
+                "refused".into(),
+                cx,
+            ))
+            .await,
+            Err(SteeringError::Refused(_))
+        ));
+        harness
+            .connection
+            .remove_session(&session_id, thread.entity_id());
+        assert!(
+            !harness
+                .connection
+                .session_steering
+                .borrow()
+                .contains_key(&session_id)
+        );
+    }
 
     #[test]
     fn test_auth_error_mapping_retains_sdk_record_and_description() {

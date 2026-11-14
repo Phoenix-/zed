@@ -231,6 +231,22 @@ pub trait AgentConnection {
         Ok(())
     }
 
+    fn supports_steering(&self, _session_id: &acp_v2::SessionId, _cx: &App) -> bool {
+        false
+    }
+
+    fn steer(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _content: Vec<acp_v2::ContentBlock>,
+        _prompt_id: SharedString,
+        _cx: &App,
+    ) -> Task<Result<SteeringOutcome, SteeringError>> {
+        Task::ready(Err(SteeringError::Refused(anyhow::anyhow!(
+            "This agent does not support steering"
+        ))))
+    }
+
     /// Receipt transports acknowledge acceptance through `receipt_submissions`
     /// instead of implementing this completion-based path.
     fn prompt(
@@ -365,6 +381,32 @@ pub trait ReceiptSessionSubmissions {
 pub trait AgentSessionRetry {
     fn run(&self, cx: &mut App) -> Task<Result<acp_v1::PromptResponse>>;
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteeringOutcome {
+    Injected,
+    PromptRequired,
+}
+
+#[derive(Debug)]
+pub enum SteeringError {
+    Refused(anyhow::Error),
+    DeliveryUnknown(anyhow::Error),
+}
+
+impl fmt::Display for SteeringError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(error) => write!(formatter, "Steering refused: {error}"),
+            Self::DeliveryUnknown(error) => write!(
+                formatter,
+                "Steering delivery is unknown; the message will not be sent again automatically: {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SteeringError {}
 
 pub trait AgentSessionSetTitle {
     fn run(&self, title: SharedString, cx: &mut App) -> Task<Result<()>>;
@@ -1018,6 +1060,10 @@ mod test_support {
         auth_methods: Vec<acp_v2::AuthMethod>,
         next_authenticate_response: Arc<Mutex<Option<oneshot::Receiver<Result<()>>>>>,
         next_load_error: Arc<Mutex<Option<anyhow::Error>>>,
+        next_steering_response:
+            Arc<Mutex<Option<oneshot::Receiver<Result<SteeringOutcome, SteeringError>>>>>,
+        steering_calls: Arc<Mutex<Vec<Vec<acp_v2::ContentBlock>>>>,
+        supports_steering: bool,
         next_receipt_response:
             Arc<Mutex<Option<oneshot::Receiver<Result<acp_v2::PromptResponse>>>>>,
         receipt_prompt: Arc<Mutex<Option<Vec<acp_v2::ContentBlock>>>>,
@@ -1068,6 +1114,9 @@ mod test_support {
                 auth_methods: Vec::new(),
                 next_authenticate_response: Default::default(),
                 next_load_error: Default::default(),
+                next_steering_response: Default::default(),
+                steering_calls: Default::default(),
+                supports_steering: false,
                 next_receipt_response: Default::default(),
                 receipt_prompt: Default::default(),
                 next_truncate: Default::default(),
@@ -1101,6 +1150,23 @@ mod test_support {
 
         pub fn set_next_load_error(&self, error: anyhow::Error) {
             *self.next_load_error.lock() = Some(error);
+        }
+
+        pub fn with_steering(mut self) -> Self {
+            self.supports_steering = true;
+            self
+        }
+
+        pub fn defer_next_steering_response(
+            &self,
+        ) -> oneshot::Sender<Result<SteeringOutcome, SteeringError>> {
+            let (sender, receiver) = oneshot::channel();
+            *self.next_steering_response.lock() = Some(receiver);
+            sender
+        }
+
+        pub fn steering_calls(&self) -> Vec<Vec<acp_v2::ContentBlock>> {
+            self.steering_calls.lock().clone()
         }
 
         pub fn shutdown_calls(&self) -> usize {
@@ -1347,6 +1413,29 @@ mod test_support {
     }
 
     impl AgentConnection for StubAgentConnection {
+        fn supports_steering(&self, _session_id: &acp_v2::SessionId, _cx: &App) -> bool {
+            self.supports_steering
+        }
+
+        fn steer(
+            &self,
+            _session_id: &acp_v2::SessionId,
+            content: Vec<acp_v2::ContentBlock>,
+            _prompt_id: SharedString,
+            cx: &App,
+        ) -> Task<Result<SteeringOutcome, SteeringError>> {
+            self.steering_calls.lock().push(content);
+            let response = self.next_steering_response.lock().take();
+            cx.foreground_executor().spawn(async move {
+                match response {
+                    Some(response) => response
+                        .await
+                        .map_err(|error| SteeringError::DeliveryUnknown(error.into()))?,
+                    None => Ok(SteeringOutcome::Injected),
+                }
+            })
+        }
+
         fn shutdown(&self) {
             self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
         }

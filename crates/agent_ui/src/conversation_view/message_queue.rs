@@ -9,12 +9,20 @@ pub struct QueueEntry {
     pub id: QueueEntryId,
     pub content: Vec<acp_v2::ContentBlock>,
     pub tracked_buffers: Vec<Entity<Buffer>>,
-    /// When true, this message interrupts the agent at the next turn boundary
-    /// instead of waiting for generation to fully complete. Only the front
-    /// entry's value matters, since messages are delivered in FIFO order.
+    /// Native agents consume only the front entry's flag at their next step
+    /// boundary. External agents can steer a flagged entry immediately.
     pub steer: bool,
+    pub delivery: QueueEntryDelivery,
     pub editor: Entity<MessageEditor>,
     pub _subscription: Subscription,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum QueueEntryDelivery {
+    #[default]
+    Queued,
+    Steering,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,9 +83,49 @@ impl MessageQueue {
     }
 
     pub fn toggle_steer(&mut self, id: QueueEntryId) {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id)
+            && entry.delivery == QueueEntryDelivery::Queued
+        {
             entry.steer = !entry.steer;
         }
+    }
+
+    pub fn begin_steering(&mut self) -> Option<QueueEntryId> {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.delivery == QueueEntryDelivery::Steering)
+        {
+            return None;
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.steer && entry.delivery == QueueEntryDelivery::Queued)?;
+        entry.delivery = QueueEntryDelivery::Steering;
+        Some(entry.id)
+    }
+
+    pub fn finish_steering(&mut self, id: QueueEntryId, delivery: QueueEntryDelivery) {
+        if let Some(entry) = self.entry_by_id_mut(id)
+            && entry.delivery == QueueEntryDelivery::Steering
+        {
+            entry.delivery = delivery;
+            entry.steer = false;
+        }
+    }
+
+    pub fn require_prompt(&mut self, id: QueueEntryId) {
+        self.finish_steering(id, QueueEntryDelivery::Queued);
+        if let Some(entry) = self.remove(id) {
+            self.entries.push_front(entry);
+        }
+    }
+
+    pub fn is_steering(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.delivery == QueueEntryDelivery::Steering)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &QueueEntry> {
@@ -85,7 +133,7 @@ impl MessageQueue {
     }
 
     pub fn can_fast_track(&self) -> bool {
-        self.can_fast_track && !self.entries.is_empty()
+        self.can_fast_track && self.front_is_deliverable()
     }
 
     pub fn entry_by_id(&self, id: QueueEntryId) -> Option<&QueueEntry> {
@@ -114,6 +162,9 @@ impl MessageQueue {
     }
 
     pub fn remove(&mut self, id: QueueEntryId) -> Option<QueueEntry> {
+        if self.entry_by_id(id)?.delivery == QueueEntryDelivery::Steering {
+            return None;
+        }
         let index = self.entries.iter().position(|entry| entry.id == id)?;
         self.entries.remove(index)
     }
@@ -129,6 +180,9 @@ impl MessageQueue {
     }
 
     pub fn clear(&mut self) {
+        if self.is_steering() {
+            return;
+        }
         self.entries.clear();
         self.can_fast_track = false;
     }
@@ -141,7 +195,7 @@ impl MessageQueue {
     /// the dispatch will cancel it, so we must absorb that cancellation's
     /// Stopped event to avoid double-sending the next entry.
     pub fn try_fast_track(&mut self, is_generating: bool) -> Option<QueueEntry> {
-        if !self.can_fast_track {
+        if !self.can_fast_track() {
             return None;
         }
         self.can_fast_track = false;
@@ -157,7 +211,9 @@ impl MessageQueue {
     /// Handles a generation Stopped event, returning the entry to auto-send,
     /// if any.
     pub fn auto_send_candidate(&self, is_first_editor_focused: bool) -> Option<&QueueEntry> {
-        if matches!(self.processing_state, ProcessingState::AutoProcess) && !is_first_editor_focused
+        if matches!(self.processing_state, ProcessingState::AutoProcess)
+            && !is_first_editor_focused
+            && self.front_is_deliverable()
         {
             self.entries.front()
         } else {
@@ -189,6 +245,14 @@ impl MessageQueue {
     /// flight, the dispatch will cancel it, so we must absorb that
     /// cancellation's Stopped event.
     pub fn send_now(&mut self, id: QueueEntryId, is_generating: bool) -> Option<QueueEntry> {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.delivery == QueueEntryDelivery::Steering)
+            || self.entry_by_id(id)?.delivery != QueueEntryDelivery::Queued
+        {
+            return None;
+        }
         let entry = self.remove(id)?;
         if is_generating {
             self.processing_state = ProcessingState::AbsorbingCancel;
@@ -206,5 +270,16 @@ impl MessageQueue {
     /// This is what un-freezes the queue after a manual stop.
     pub fn resume(&mut self) {
         self.processing_state = ProcessingState::AutoProcess;
+    }
+
+    fn front_is_deliverable(&self) -> bool {
+        !self
+            .entries
+            .iter()
+            .any(|entry| entry.delivery == QueueEntryDelivery::Steering)
+            && self
+                .entries
+                .front()
+                .is_some_and(|entry| entry.delivery == QueueEntryDelivery::Queued)
     }
 }

@@ -7194,6 +7194,32 @@ impl AcpThread {
         Ok(())
     }
 
+    pub fn append_steered_user_message(
+        &mut self,
+        content: Vec<acp_v2::ContentBlock>,
+        cx: &mut Context<Self>,
+    ) {
+        self.flush_streaming_text(cx);
+        let language_registry = self.project.read(cx).languages().clone();
+        let path_style = self.project.read(cx).path_style(cx);
+        let mut message = MessageContent::default();
+        for block in content {
+            message.append_prompt(block, &language_registry, path_style, cx);
+        }
+        self.push_entry(
+            AgentThreadEntry::UserMessage(UserMessage {
+                identity: MessageIdentity::Legacy(None),
+                meta: None,
+                client_id: None,
+                is_optimistic: true,
+                content: message,
+                indented: false,
+            }),
+            cx,
+        );
+        cx.notify();
+    }
+
     pub fn finish_local_turn(&mut self, reason: acp_v2::StopReason, cx: &mut Context<Self>) {
         self.flush_streaming_text(cx);
         self.cleanup_local_turn(&reason, true, cx);
