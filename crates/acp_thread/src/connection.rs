@@ -541,6 +541,13 @@ pub enum SessionListUpdate {
     SessionRemoved {
         session_id: acp_v2::SessionId,
     },
+    /// The current activity snapshot of a listed session. `None` means the agent
+    /// advertised the extension but this update was malformed, so activity is
+    /// unconfirmed rather than idle.
+    SessionState {
+        session_id: acp_v2::SessionId,
+        snapshot: Option<crate::SessionStateSnapshot>,
+    },
 }
 
 pub trait AgentSessionList {
@@ -569,6 +576,12 @@ pub trait AgentSessionList {
     /// Whether the agent pushes changes to its session list, so that watchers
     /// don't need to poll it.
     fn notifies_changes(&self) -> bool {
+        false
+    }
+
+    /// Whether the agent advertises the session-state extension, so that listed
+    /// sessions without a snapshot have unknown rather than idle activity.
+    fn supports_session_state(&self) -> bool {
         false
     }
 

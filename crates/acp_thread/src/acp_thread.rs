@@ -10,6 +10,7 @@ pub mod interactivity;
 mod mention;
 pub mod notices;
 pub mod prompt_capabilities;
+pub mod session_state;
 pub mod subagents;
 mod submission;
 mod terminal;
@@ -40,6 +41,7 @@ use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{AgentLocation, Project};
 use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
+pub use session_state::*;
 use settings::{Settings, SettingsStore};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -3621,6 +3623,10 @@ pub struct AcpThread {
     submissions: SessionSubmissions,
     activity: SessionActivity,
     received_session_state: bool,
+    /// Whether this session's activity comes from the agent's session-state
+    /// extension rather than from Zed's own prompt turns.
+    reported_activity: bool,
+    session_state: SessionStateReconciler,
     reported_usage: Option<ReportedTokenUsage>,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
@@ -3983,6 +3989,8 @@ impl AcpThread {
             ),
             activity: SessionActivity::default(),
             received_session_state: false,
+            reported_activity: false,
+            session_state: SessionStateReconciler::default(),
             reported_usage: None,
             connection,
             token_usage: None,
@@ -4289,10 +4297,89 @@ impl AcpThread {
     /// Whether the agent reports this session's foreground state, rather than Zed
     /// deriving it from its own prompt turns.
     pub fn uses_reported_activity(&self) -> bool {
-        !matches!(
-            self.submissions.transport(),
-            SubmissionTransport::Completion
-        )
+        self.reported_activity
+            || !matches!(
+                self.submissions.transport(),
+                SubmissionTransport::Completion
+            )
+    }
+
+    /// Switches this session from prompt-derived activity to the agent's
+    /// session-state extension. Until the first snapshot arrives, activity is
+    /// unconfirmed rather than the idle default of a new session.
+    pub fn enable_reported_activity(&mut self, cx: &mut Context<Self>) {
+        if self.reported_activity {
+            return;
+        }
+        self.reported_activity = true;
+        self.session_state.reset();
+        let previous = self.foreground_activity();
+        self.activity.mark_unconfirmed();
+        if previous != self.foreground_activity() {
+            cx.emit(AcpThreadEvent::StatusChanged);
+        }
+        cx.notify();
+    }
+
+    /// Applies a live notification snapshot. A new epoch replaces the previous one;
+    /// snapshots from retired epochs are ignored.
+    pub fn apply_live_session_state(
+        &mut self,
+        snapshot: SessionStateSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Result<bool> {
+        self.apply_reconciled_session_state(snapshot, true, cx)
+    }
+
+    /// Applies a snapshot from a list or open response. It can establish the first
+    /// epoch but cannot replace a bound or retired one.
+    pub fn apply_session_state_snapshot(
+        &mut self,
+        snapshot: SessionStateSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Result<bool> {
+        self.apply_reconciled_session_state(snapshot, false, cx)
+    }
+
+    fn apply_reconciled_session_state(
+        &mut self,
+        snapshot: SessionStateSnapshot,
+        live: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            self.reported_activity,
+            "Session does not use the session-state extension"
+        );
+        let accepted = if live {
+            self.session_state.accept_live(&snapshot)
+        } else {
+            self.session_state.accept_snapshot(&snapshot)
+        };
+        if !accepted {
+            return Ok(false);
+        }
+        self.update_session_state(snapshot.state.activity(), cx)?;
+        Ok(true)
+    }
+
+    /// Marks activity unknown without claiming the session is idle, as when a
+    /// payload is malformed or the connection ends.
+    pub fn mark_session_state_unknown(&mut self, cx: &mut Context<Self>) {
+        if !self.reported_activity {
+            return;
+        }
+        let previous = self.foreground_activity();
+        self.activity.mark_unconfirmed();
+        if previous != self.foreground_activity() {
+            cx.emit(AcpThreadEvent::StatusChanged);
+            cx.notify();
+        }
+    }
+
+    /// A reconnect gets a new epoch even for the same session.
+    pub fn reset_session_state_epoch(&mut self) {
+        self.session_state.reset();
     }
 
     pub fn foreground_state(&self) -> Option<&acp_v2::StateUpdate> {
@@ -7254,11 +7341,13 @@ impl AcpThread {
                 }
             }),
         });
-        self.set_foreground_state(
-            acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
-            cx,
-        );
-        cx.emit(AcpThreadEvent::StatusChanged);
+        if !self.uses_reported_activity() {
+            self.set_foreground_state(
+                acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                cx,
+            );
+            cx.emit(AcpThreadEvent::StatusChanged);
+        }
 
         let completion = async move |thread: WeakEntity<Self>, cx: &mut AsyncApp| {
             let response = rx.await;
@@ -7281,10 +7370,14 @@ impl AcpThread {
                 // state even when the send_task is cancelled before tx.send().
                 if is_same_turn {
                     this.running_turn.take();
-                    this.set_foreground_state(
-                        acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
-                        cx,
-                    );
+                    // With the session-state extension, a finished prompt does not
+                    // mean the whole session is idle.
+                    if !this.uses_reported_activity() {
+                        this.set_foreground_state(
+                            acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
+                            cx,
+                        );
+                    }
                 }
 
                 if this.turn_id == turn_id {
@@ -7361,18 +7454,20 @@ impl AcpThread {
                         if is_same_turn {
                             cx.emit(AcpThreadEvent::StatusChanged);
                         }
-                        let stop_reason = stop_reason_from_v1(&r.stop_reason);
-                        this.set_foreground_state(
-                            acp_v2::StateUpdate::Idle(
-                                acp_v2::IdleStateUpdate::new().stop_reason(stop_reason.clone()),
-                            ),
-                            cx,
-                        );
-                        cx.emit(AcpThreadEvent::Stopped {
-                            activity_generation: this.activity.generation(),
-                            activity_duration: this.activity.duration(),
-                            stop_reason,
-                        });
+                        if !this.uses_reported_activity() {
+                            let stop_reason = stop_reason_from_v1(&r.stop_reason);
+                            this.set_foreground_state(
+                                acp_v2::StateUpdate::Idle(
+                                    acp_v2::IdleStateUpdate::new().stop_reason(stop_reason.clone()),
+                                ),
+                                cx,
+                            );
+                            cx.emit(AcpThreadEvent::Stopped {
+                                activity_generation: this.activity.generation(),
+                                activity_duration: this.activity.duration(),
+                                stop_reason,
+                            });
+                        }
                         Ok(Some(r))
                     }
                     Err(e) => {
@@ -7418,7 +7513,14 @@ impl AcpThread {
             "This subagent's parent does not allow cancelling it"
         );
         self.flush_streaming_text(cx);
-        if self.uses_reported_activity() {
+        // A v1 session that reports activity still uses prompt responses for its
+        // turn, so cancelling before a follow-up must not wait for a receipt-style
+        // idle confirmation.
+        let waits_for_reported_idle = !matches!(
+            self.submissions.transport(),
+            SubmissionTransport::Completion
+        );
+        if waits_for_reported_idle {
             self.activity.ensure_observable()?;
             if self.foreground_activity() != ForegroundActivity::Idle
                 || self.has_unsettled_submissions()
@@ -7445,7 +7547,11 @@ impl AcpThread {
                     .context("Agent connection lost before cancellation was confirmed")
             }));
         }
-        if self.running_turn.is_some() {
+        let cancel_remote_activity = self.running_turn.is_some()
+            || (self.uses_reported_activity()
+                && matches!(&permission_outcome, RequestPermissionOutcome::Cancelled)
+                && self.foreground_activity().is_active());
+        if cancel_remote_activity {
             self.connection.cancel(self.session_id(), cx)?;
         }
         self.cancel_outstanding_elicitations(cx);
@@ -7459,10 +7565,12 @@ impl AcpThread {
         };
         self.shrink_message_source_capacity(turn.first_entry_index);
         self.mark_pending_entries_as_canceled(permission_outcome, cx);
-        self.set_foreground_state(
-            acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
-            cx,
-        );
+        if !self.uses_reported_activity() {
+            self.set_foreground_state(
+                acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
+                cx,
+            );
+        }
         cx.emit(AcpThreadEvent::StatusChanged);
 
         // Wait for the send task to complete
@@ -11724,6 +11832,409 @@ mod tests {
         });
         cx.update(|cx| connection.track_session(&thread, cx));
         (thread, connection)
+    }
+
+    async fn new_session_state_test_thread(
+        cx: &mut TestAppContext,
+    ) -> (Entity<AcpThread>, Rc<StubAgentConnection>) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .expect("session-state session");
+        thread.update(cx, |thread, cx| thread.enable_reported_activity(cx));
+        (thread, connection)
+    }
+
+    fn session_state(
+        state: ReportedSessionState,
+        epoch: &str,
+        revision: u64,
+    ) -> SessionStateSnapshot {
+        SessionStateSnapshot {
+            state,
+            epoch: epoch.into(),
+            revision,
+        }
+    }
+
+    #[gpui::test]
+    async fn session_state_own_prompt_completion_does_not_infer_idle(cx: &mut TestAppContext) {
+        let (thread, connection) = new_session_state_test_thread(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_live_session_state(session_state(ReportedSessionState::Idle, "one", 1), cx)
+                .expect("idle snapshot");
+        });
+
+        let complete = connection.defer_next_prompt_response();
+        let first = thread.update(cx, |thread, cx| thread.send(vec!["first".into()], cx));
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_live_session_state(
+                    session_state(ReportedSessionState::Running, "one", 2),
+                    cx,
+                )
+                .expect("service activity while the prompt runs");
+        });
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("complete first prompt");
+        first.await.expect("first submission");
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.foreground_activity(),
+                ForegroundActivity::Running,
+                "one finished prompt must not hide the session's remaining work"
+            );
+            assert_eq!(thread.status(), ThreadStatus::Generating);
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_live_session_state(session_state(ReportedSessionState::Idle, "one", 3), cx)
+                .expect("idle snapshot");
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle
+        );
+
+        let complete = connection.defer_next_prompt_response();
+        let second = thread.update(cx, |thread, cx| thread.send(vec!["second".into()], cx));
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_live_session_state(
+                    session_state(ReportedSessionState::Running, "one", 4),
+                    cx,
+                )
+                .expect("service activity after the second prompt");
+        });
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("complete second prompt");
+        second.await.expect("second submission");
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.foreground_activity(),
+                ForegroundActivity::Running,
+                "a later prompt's completion is also only one prompt finishing"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn session_state_is_visible_without_a_prompt_and_requires_action_is_whole_session(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _connection) = new_session_state_test_thread(cx).await;
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.foreground_activity()),
+            ForegroundActivity::Unconfirmed
+        );
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_live_session_state(
+                    session_state(ReportedSessionState::Running, "one", 1),
+                    cx,
+                )
+                .expect("service-initiated running snapshot");
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating
+        );
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_live_session_state(
+                    session_state(ReportedSessionState::RequiresAction, "one", 2),
+                    cx,
+                )
+                .expect("requires-action snapshot");
+        });
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.foreground_activity(),
+                ForegroundActivity::RequiresAction
+            );
+            assert!(thread.is_waiting_for_confirmation());
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_live_session_state(session_state(ReportedSessionState::Idle, "one", 3), cx)
+                .expect("idle snapshot");
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle
+        );
+    }
+
+    #[gpui::test]
+    async fn session_state_live_epoch_retires_old_snapshots(cx: &mut TestAppContext) {
+        let (thread, _connection) = new_session_state_test_thread(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_live_session_state(
+                    session_state(ReportedSessionState::RequiresAction, "one", 5),
+                    cx,
+                )
+                .expect("newest snapshot");
+        });
+
+        thread.update(cx, |thread, cx| {
+            assert!(
+                !thread
+                    .apply_live_session_state(
+                        session_state(ReportedSessionState::Idle, "one", 4),
+                        cx
+                    )
+                    .expect("stale live snapshot")
+            );
+            assert!(
+                !thread
+                    .apply_session_state_snapshot(
+                        session_state(ReportedSessionState::Idle, "two", 9),
+                        cx
+                    )
+                    .expect("ordinary snapshot from another epoch")
+            );
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.foreground_activity()),
+            ForegroundActivity::RequiresAction
+        );
+
+        // A bridge can restart its service without resetting the client stdio:
+        // the live epoch replaces the old one even with a lower revision.
+        thread.update(cx, |thread, cx| {
+            assert!(
+                thread
+                    .apply_live_session_state(
+                        session_state(ReportedSessionState::Idle, "two", 1),
+                        cx
+                    )
+                    .expect("live epoch replacement")
+            );
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle
+        );
+
+        thread.update(cx, |thread, cx| {
+            assert!(
+                !thread
+                    .apply_live_session_state(
+                        session_state(ReportedSessionState::Running, "one", 6),
+                        cx
+                    )
+                    .expect("late live snapshot from retired epoch")
+            );
+            assert!(
+                !thread
+                    .apply_session_state_snapshot(
+                        session_state(ReportedSessionState::Running, "one", 6),
+                        cx
+                    )
+                    .expect("late response from retired epoch")
+            );
+            assert!(
+                !thread
+                    .apply_session_state_snapshot(
+                        session_state(ReportedSessionState::Running, "two", 0),
+                        cx
+                    )
+                    .expect("older response in the current epoch")
+            );
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle
+        );
+
+        thread.update(cx, |thread, _cx| thread.reset_session_state_epoch());
+        thread.update(cx, |thread, cx| {
+            assert!(
+                thread
+                    .apply_live_session_state(
+                        session_state(ReportedSessionState::Running, "one", 1),
+                        cx
+                    )
+                    .expect("first snapshot after reconnect")
+            );
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating
+        );
+    }
+
+    #[gpui::test]
+    async fn session_state_matching_duplicate_restores_confirmation(cx: &mut TestAppContext) {
+        let (thread, _connection) = new_session_state_test_thread(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_live_session_state(
+                    session_state(ReportedSessionState::Running, "one", 5),
+                    cx,
+                )
+                .expect("running snapshot");
+            thread.mark_session_state_unknown(cx);
+        });
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.foreground_activity(),
+                ForegroundActivity::Unconfirmed
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            assert!(
+                thread
+                    .apply_live_session_state(
+                        session_state(ReportedSessionState::Running, "one", 5),
+                        cx
+                    )
+                    .expect("matching duplicate")
+            );
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating
+        );
+
+        thread.update(cx, |thread, cx| {
+            thread.mark_session_state_unknown(cx);
+            assert!(
+                !thread
+                    .apply_live_session_state(
+                        session_state(ReportedSessionState::Idle, "one", 5),
+                        cx
+                    )
+                    .expect("conflicting same revision")
+            );
+        });
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.foreground_activity(),
+                ForegroundActivity::Unconfirmed
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            assert!(
+                thread
+                    .apply_live_session_state(
+                        session_state(ReportedSessionState::Idle, "one", 6),
+                        cx
+                    )
+                    .expect("new revision")
+            );
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle
+        );
+    }
+
+    #[gpui::test]
+    async fn session_state_rejected_prompt_does_not_invent_running(cx: &mut TestAppContext) {
+        let (thread, connection) = new_session_state_test_thread(cx).await;
+        let complete = connection.defer_next_prompt_response();
+        let submission = thread.update(cx, |thread, cx| thread.send(vec!["rejected".into()], cx));
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.foreground_activity(),
+                ForegroundActivity::Unconfirmed,
+                "submitting a prompt must not invent running activity"
+            );
+        });
+
+        complete
+            .send(Err(anyhow!("rejected before any state transition")))
+            .expect("reject prompt");
+        assert!(submission.await.is_err());
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.foreground_activity(),
+                ForegroundActivity::Unconfirmed,
+                "a rejected prompt leaves authoritative activity untouched"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn session_state_disconnect_is_unknown_not_idle(cx: &mut TestAppContext) {
+        let (thread, _connection) = new_session_state_test_thread(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_live_session_state(session_state(ReportedSessionState::Idle, "one", 1), cx)
+                .expect("idle snapshot");
+            thread.mark_session_state_unknown(cx);
+        });
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.foreground_activity(),
+                ForegroundActivity::Unconfirmed
+            );
+            assert_eq!(thread.status(), ThreadStatus::Unconfirmed);
+        });
+    }
+
+    #[gpui::test]
+    async fn prompt_completion_still_infers_idle_without_the_extension(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .expect("legacy session");
+        let complete = connection.defer_next_prompt_response();
+        let submission = thread.update(cx, |thread, cx| thread.send(vec!["hello".into()], cx));
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.status(),
+                ThreadStatus::Generating,
+                "legacy prompt submission still infers running"
+            );
+        });
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("complete prompt");
+        submission.await.expect("submission");
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.uses_reported_activity());
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+        });
     }
 
     fn idle_with(stop_reason: acp_v2::StopReason) -> acp_v2::StateUpdate {

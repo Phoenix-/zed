@@ -28,7 +28,7 @@ use std::{
 
 use acp_thread::{
     AgentSessionInfo, AgentSessionInfoUpdate, AgentSessionList, AgentSessionListRequest,
-    SessionListUpdate, interactivity::interactivity_from_meta,
+    SessionListUpdate, SessionStateSnapshot, interactivity::interactivity_from_meta,
 };
 use agent::ThreadStore;
 use agent_client_protocol::schema::v2 as acp;
@@ -57,6 +57,7 @@ use crate::{
     Agent, ConversationView,
     agent_connection_store::{AgentConnectionEntry, AgentConnectionStore},
     open_elsewhere_store::{OpenElsewhereStore, open_elsewhere_from_meta},
+    session_activity_store::SessionActivityStore,
     thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore, WorktreePaths},
     thread_parent_store::{ThreadParentStore, parent_session_id_from_meta},
 };
@@ -502,6 +503,7 @@ impl SessionAutoImport {
         });
         for source in unwatched {
             forget_open_elsewhere(&source, cx);
+            forget_session_activity(&source, cx);
         }
         self.pending_connections
             .retain(|(source, store)| store.upgrade().is_some() && enabled.contains(source));
@@ -699,6 +701,7 @@ impl SessionAutoImport {
                 .any(|other| other.source == watcher.source)
             {
                 forget_open_elsewhere(&watcher.source, cx);
+                forget_session_activity(&watcher.source, cx);
             }
         }
         self.sync_all_stores(cx);
@@ -768,6 +771,22 @@ impl SessionAutoImport {
                 .collect::<Vec<_>>();
             open_elsewhere_store.update(cx, |open_elsewhere_store, cx| {
                 open_elsewhere_store.apply_listing(source, holders, listing.complete, cx);
+            });
+        }
+        if let Some(activity_store) = SessionActivityStore::try_global(cx) {
+            let states = listing
+                .sessions
+                .iter()
+                .map(|session| {
+                    (
+                        session.session_id.clone(),
+                        SessionStateSnapshot::from_meta(session.meta.as_ref()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let supported = session_list.supports_session_state();
+            activity_store.update(cx, |activity_store, cx| {
+                activity_store.apply_listing(source, states, listing.complete, supported, cx);
             });
         }
         let open_thread_ids = self.open_thread_ids(cx);
@@ -895,6 +914,22 @@ impl SessionAutoImport {
         }
     }
 
+    /// Records a live activity snapshot for a session, which the sidebar can show
+    /// even when no conversation of it is loaded.
+    fn apply_session_state(
+        &mut self,
+        source: &SessionSource,
+        session_id: acp::SessionId,
+        snapshot: Option<SessionStateSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(store) = SessionActivityStore::try_global(cx) {
+            store.update(cx, |store, cx| {
+                store.set_live_snapshot(source, session_id, snapshot, cx)
+            });
+        }
+    }
+
     /// Reconciles a thread with the archived flag its agent reported for the
     /// session outside a listing.
     fn apply_reported_archive(
@@ -1013,6 +1048,9 @@ impl SessionAutoImport {
         cx: &mut Context<Self>,
     ) {
         self.known_sessions.remove(source, session_id);
+        if let Some(store) = SessionActivityStore::try_global(cx) {
+            store.update(cx, |store, cx| store.forget_session(source, session_id, cx));
+        }
         let store = ThreadMetadataStore::global(cx);
         let Some(thread_id) = agent_threads(store.read(cx), source)
             .get(session_id)
@@ -1367,6 +1405,15 @@ async fn watch_session_list(
                     })
                     .ok();
                 }
+                SessionListUpdate::SessionState {
+                    session_id,
+                    snapshot,
+                } => {
+                    this.update(cx, |this, cx| {
+                        this.apply_session_state(&source, session_id, snapshot, cx)
+                    })
+                    .ok();
+                }
             }
         }
     }
@@ -1374,7 +1421,10 @@ async fn watch_session_list(
         .update(cx, |this, cx| this.stop_watcher(watcher_id, cx))
         .is_err()
     {
-        cx.update(|cx| forget_open_elsewhere(&source, cx));
+        cx.update(|cx| {
+            forget_open_elsewhere(&source, cx);
+            forget_session_activity(&source, cx);
+        });
     }
 }
 
@@ -1382,6 +1432,13 @@ async fn watch_session_list(
 /// open in other apps would go stale.
 fn forget_open_elsewhere(source: &SessionSource, cx: &mut App) {
     if let Some(store) = OpenElsewhereStore::try_global(cx) {
+        store.update(cx, |store, cx| store.forget_source(source, cx));
+    }
+}
+
+/// Activity reported by a connection that ended is unknown, not the last state.
+fn forget_session_activity(source: &SessionSource, cx: &mut App) {
+    if let Some(store) = SessionActivityStore::try_global(cx) {
         store.update(cx, |store, cx| store.forget_source(source, cx));
     }
 }

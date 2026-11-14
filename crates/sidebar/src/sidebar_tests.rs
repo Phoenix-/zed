@@ -1,10 +1,14 @@
 use super::*;
-use acp_thread::{AcpThread, PermissionOptions, StubAgentConnection};
+use acp_thread::{
+    AcpThread, PermissionOptions, ReportedSessionState, SessionStateSnapshot, StubAgentConnection,
+};
 use agent::ThreadStore;
 use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp_v2};
 use agent_settings::AgentSettings;
 use agent_ui::{
     ThreadId,
+    session_activity_store::SessionActivityStore,
+    session_auto_import::SessionSource,
     terminal_thread_metadata_store::{
         TerminalThreadMetadata, TerminalThreadMetadataStore, TestTerminalMetadataDbName,
     },
@@ -124,6 +128,23 @@ fn has_thread_entry(sidebar: &Sidebar, session_id: &acp::SessionId) -> bool {
         .entries
         .iter()
         .any(|entry| matches!(entry, ListEntry::Thread(t) if t.metadata.session_id.as_ref() == Some(session_id)))
+}
+
+#[track_caller]
+fn thread_row_status(sidebar: &Sidebar, session_id: &acp::SessionId) -> AgentThreadStatus {
+    sidebar
+        .contents
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            ListEntry::Thread(thread)
+                if thread.metadata.session_id.as_ref() == Some(session_id) =>
+            {
+                Some(thread.status)
+            }
+            _ => None,
+        })
+        .expect("thread row")
 }
 
 #[track_caller]
@@ -16648,4 +16669,346 @@ async fn test_failed_auto_import_connections_are_retried_when_their_backoff_expi
         assert_eq!(requests.get(), attempts, "after another {wait} s");
     }
     drop(connections);
+}
+
+#[gpui::test]
+async fn test_imported_session_activity_shows_without_a_loaded_conversation(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project("/project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    cx.update(|_, cx| agent_ui::session_activity_store::init(cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let session_id = acp::SessionId::new(Arc::from("imported-session"));
+    save_thread_metadata(
+        session_id.clone(),
+        Some("Imported Session".into()),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    let source = SessionSource::local(agent::ZED_AGENT_ID.clone());
+
+    let set_state = |state: ReportedSessionState, revision: u64, cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let store = SessionActivityStore::try_global(cx).expect("activity store");
+            store.update(cx, |store, cx| {
+                store.set_live_snapshot(
+                    &source,
+                    session_id.clone(),
+                    Some(SessionStateSnapshot {
+                        state,
+                        epoch: "conductor".into(),
+                        revision,
+                    }),
+                    cx,
+                );
+            });
+        });
+        sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+        cx.run_until_parked();
+    };
+    let status = |cx: &mut VisualTestContext| {
+        sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    ListEntry::Thread(thread)
+                        if thread.metadata.session_id.as_ref() == Some(&session_id) =>
+                    {
+                        Some(thread.status)
+                    }
+                    _ => None,
+                })
+                .expect("imported thread row")
+        })
+    };
+
+    set_state(ReportedSessionState::Running, 1, cx);
+    assert_eq!(status(cx), AgentThreadStatus::Running);
+
+    set_state(ReportedSessionState::RequiresAction, 2, cx);
+    assert_eq!(status(cx), AgentThreadStatus::WaitingForConfirmation);
+
+    set_state(ReportedSessionState::Idle, 3, cx);
+    assert_eq!(status(cx), AgentThreadStatus::Completed);
+}
+
+#[gpui::test]
+async fn test_imported_session_disconnect_is_unconfirmed_and_rebinds(cx: &mut TestAppContext) {
+    let project = init_test_project("/project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    cx.update(|_, cx| agent_ui::session_activity_store::init(cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let session_id = acp::SessionId::new(Arc::from("imported-disconnect"));
+    save_thread_metadata(
+        session_id.clone(),
+        Some("Imported Disconnect".into()),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    let source = SessionSource::local(agent::ZED_AGENT_ID.clone());
+    let set_state =
+        |state: ReportedSessionState, epoch: &str, revision: u64, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let store = SessionActivityStore::try_global(cx).expect("activity store");
+                store.update(cx, |store, cx| {
+                    store.set_live_snapshot(
+                        &source,
+                        session_id.clone(),
+                        Some(SessionStateSnapshot {
+                            state,
+                            epoch: epoch.into(),
+                            revision,
+                        }),
+                        cx,
+                    );
+                });
+            });
+            sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+            cx.run_until_parked();
+        };
+
+    set_state(ReportedSessionState::Running, "one", 1, cx);
+    assert_eq!(
+        sidebar.read_with(cx, |sidebar, _| thread_row_status(sidebar, &session_id)),
+        AgentThreadStatus::Running
+    );
+
+    cx.update(|_, cx| {
+        let store = SessionActivityStore::try_global(cx).expect("activity store");
+        store.update(cx, |store, cx| store.forget_source(&source, cx));
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        sidebar.read_with(cx, |sidebar, _| thread_row_status(sidebar, &session_id)),
+        AgentThreadStatus::Unconfirmed,
+        "disconnect must not make an unopened row look completed"
+    );
+
+    let key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.toggle_collapse(&key, window, cx);
+    });
+    cx.run_until_parked();
+    let (has_running, waiting_count) = sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::ProjectHeader {
+                    has_running_threads,
+                    waiting_thread_count,
+                    ..
+                } => Some((*has_running_threads, *waiting_thread_count)),
+                _ => None,
+            })
+            .expect("project header")
+    });
+    assert!(!has_running);
+    assert_eq!(waiting_count, 0);
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.toggle_collapse(&key, window, cx);
+    });
+    cx.run_until_parked();
+    set_state(ReportedSessionState::Running, "two", 1, cx);
+    assert_eq!(
+        sidebar.read_with(cx, |sidebar, _| thread_row_status(sidebar, &session_id)),
+        AgentThreadStatus::Running,
+        "a new epoch can bind after disconnect tombstones the session"
+    );
+}
+
+#[gpui::test]
+async fn test_loaded_extension_thread_uses_aggregate_activity(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    open_thread_with_connection(&panel, StubAgentConnection::new(), cx);
+
+    let thread = panel.read_with(cx, |panel, cx| {
+        panel
+            .active_agent_thread(cx)
+            .expect("loaded extension thread")
+    });
+    let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+    save_test_thread_metadata(&session_id, &project, cx).await;
+    thread.update(cx, |thread, cx| {
+        thread.enable_reported_activity(cx);
+        thread
+            .apply_live_session_state(
+                SessionStateSnapshot {
+                    state: ReportedSessionState::Running,
+                    epoch: "conductor".into(),
+                    revision: 1,
+                },
+                cx,
+            )
+            .expect("running snapshot");
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(
+            agent_thread_status(thread, true),
+            AgentThreadStatus::Running,
+            "a local approval must not hide authoritative running work"
+        );
+    });
+    assert_eq!(
+        sidebar.read_with(cx, |sidebar, _| thread_row_status(sidebar, &session_id)),
+        AgentThreadStatus::Running
+    );
+
+    thread.update(cx, |thread, cx| {
+        thread
+            .apply_live_session_state(
+                SessionStateSnapshot {
+                    state: ReportedSessionState::RequiresAction,
+                    epoch: "conductor".into(),
+                    revision: 2,
+                },
+                cx,
+            )
+            .expect("requires-action snapshot");
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(
+            agent_thread_status(thread, false),
+            AgentThreadStatus::WaitingForConfirmation
+        );
+    });
+    assert_eq!(
+        sidebar.read_with(cx, |sidebar, _| thread_row_status(sidebar, &session_id)),
+        AgentThreadStatus::WaitingForConfirmation
+    );
+
+    thread.update(cx, |thread, cx| {
+        thread
+            .report_local_execution_error(Arc::new(anyhow::anyhow!("fatal turn error")), cx)
+            .expect("report local execution error");
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(
+            thread.foreground_activity(),
+            acp_thread::ForegroundActivity::Idle
+        );
+        assert!(thread.had_error());
+        assert_eq!(
+            agent_thread_status(thread, false),
+            AgentThreadStatus::Error,
+            "an idle reported session with a local error must keep its error UI"
+        );
+    });
+    assert_eq!(
+        sidebar.read_with(cx, |sidebar, _| thread_row_status(sidebar, &session_id)),
+        AgentThreadStatus::Error
+    );
+}
+
+#[gpui::test]
+async fn test_collapsed_project_counts_imported_session_activity(cx: &mut TestAppContext) {
+    let project = init_test_project("/project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    cx.update(|_, cx| agent_ui::session_activity_store::init(cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let running = acp::SessionId::new(Arc::from("imported-running"));
+    let waiting = acp::SessionId::new(Arc::from("imported-waiting"));
+    for (session_id, title) in [
+        (running.clone(), "Running Import"),
+        (waiting.clone(), "Waiting Import"),
+    ] {
+        save_thread_metadata(
+            session_id,
+            Some(title.into()),
+            chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+            None,
+            None,
+            &project,
+            cx,
+        );
+    }
+    let source = SessionSource::local(agent::ZED_AGENT_ID.clone());
+    cx.update(|_, cx| {
+        let store = SessionActivityStore::try_global(cx).expect("activity store");
+        store.update(cx, |store, cx| {
+            store.set_live_snapshot(
+                &source,
+                running.clone(),
+                Some(SessionStateSnapshot {
+                    state: ReportedSessionState::Running,
+                    epoch: "conductor".into(),
+                    revision: 1,
+                }),
+                cx,
+            );
+            store.set_live_snapshot(
+                &source,
+                waiting.clone(),
+                Some(SessionStateSnapshot {
+                    state: ReportedSessionState::RequiresAction,
+                    epoch: "conductor".into(),
+                    revision: 1,
+                }),
+                cx,
+            );
+        });
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    let key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.toggle_collapse(&key, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["> [project]"]
+    );
+
+    let (has_running, waiting_count) = sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::ProjectHeader {
+                    has_running_threads,
+                    waiting_thread_count,
+                    ..
+                } => Some((*has_running_threads, *waiting_thread_count)),
+                _ => None,
+            })
+            .expect("project header")
+    });
+    assert!(has_running, "collapsed group must show imported running");
+    assert_eq!(
+        waiting_count, 1,
+        "collapsed group must count imported requires_action"
+    );
 }

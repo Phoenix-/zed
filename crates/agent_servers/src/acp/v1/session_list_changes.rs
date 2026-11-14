@@ -334,6 +334,9 @@ mod tests {
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates: false,
+            session_state: Rc::new(RefCell::new(
+                crate::acp::v1::session_state::SessionStateExtension::from_enabled(false),
+            )),
         };
         let _dispatch_task = cx.spawn(async move |mut cx| {
             while let Some(work) = dispatch_rx.next().await {

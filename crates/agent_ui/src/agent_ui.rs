@@ -26,6 +26,7 @@ mod model_selector;
 mod model_selector_popover;
 pub mod open_elsewhere_store;
 mod profile_selector;
+pub mod session_activity_store;
 pub mod session_auto_import;
 mod terminal_codegen;
 mod terminal_inline_assistant;
@@ -718,6 +719,7 @@ pub fn init(
     thread_parent_store::init(cx);
     open_elsewhere_store::init(cx);
     session_auto_import::init(cx);
+    session_activity_store::init(cx);
     terminal_thread_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);

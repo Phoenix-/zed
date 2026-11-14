@@ -210,6 +210,9 @@ mod tests {
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates: false,
+            session_state: Rc::new(RefCell::new(
+                crate::acp::v1::session_state::SessionStateExtension::from_enabled(false),
+            )),
         };
         let (mut runtime, shutdown) = ClientRuntime::new(context, &mut cx.to_async());
         let retained_sender = runtime.sender();

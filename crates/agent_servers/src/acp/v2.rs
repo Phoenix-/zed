@@ -352,6 +352,9 @@ impl AcpV2Connection {
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: Some(RefCell::new(Default::default())),
             accepts_subagent_updates: true,
+            session_state: Rc::new(RefCell::new(
+                crate::acp::v1::session_state::SessionStateExtension::from_enabled(false),
+            )),
         };
         let (mut client_runtime, shutdown) = runtime::ClientRuntime::new(context, cx);
         let dispatch_tx = client_runtime.sender();

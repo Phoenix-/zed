@@ -2,11 +2,13 @@ mod open_elsewhere;
 mod thread_switcher;
 mod thread_tree;
 
-use acp_thread::ThreadStatus;
+use acp_thread::{ForegroundActivity, ThreadStatus};
 use action_log::DiffStats;
 use agent::{ThreadStore, ZED_AGENT_ID};
 use agent_client_protocol::schema::v2 as acp;
 use agent_settings::{AgentSettings, THREADS_LIST_MAX_WIDTH, THREADS_LIST_MIN_WIDTH};
+use agent_ui::session_activity_store::SessionActivityStore;
+use agent_ui::session_auto_import::SessionSource;
 use agent_ui::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
@@ -935,6 +937,7 @@ impl Sidebar {
             .detach();
         }
         Self::observe_open_elsewhere(cx);
+        Self::observe_session_activity(cx);
 
         let channels_with_threads = channels_with_threads(cx);
         cx.spawn(async move |this, cx| {
@@ -1398,6 +1401,15 @@ impl Sidebar {
         .detach_and_log_err(cx);
     }
 
+    fn observe_session_activity(cx: &mut Context<Self>) {
+        if let Some(store) = SessionActivityStore::try_global(cx) {
+            cx.observe(&store, |this, _store, cx| {
+                this.schedule_update_entries(false, cx);
+            })
+            .detach();
+        }
+    }
+
     /// Rebuilds the sidebar contents from current workspace and thread state.
     ///
     /// Iterates [`MultiWorkspace::project_group_keys`] to determine project
@@ -1792,6 +1804,7 @@ impl Sidebar {
 
                 // Merge live info into threads and update notification state
                 // in a single pass.
+                let activity_store = SessionActivityStore::try_global(cx);
                 for thread in &mut threads {
                     if let Some(session_id) = thread.metadata.session_id.clone() {
                         if let Some(info) = live_info_by_session.get(&session_id) {
@@ -1799,6 +1812,26 @@ impl Sidebar {
                             let thread_id = thread.metadata.thread_id;
                             Arc::make_mut(thread).apply_active_info(info);
                             new_live_statuses.insert(session_id, (status, thread_id));
+                        }
+                    }
+
+                    let activity_session_id = thread.metadata.session_id.clone();
+                    // Imported sessions have no conversation view to report
+                    // activity, so their current snapshot drives the row.
+                    if !thread.is_live
+                        && let (Some(activity_store), Some(session_id)) =
+                            (activity_store.as_ref(), activity_session_id.as_ref())
+                        && let Some(status) = activity_store
+                            .read(cx)
+                            .status(&SessionSource::of_thread(&thread.metadata), session_id)
+                    {
+                        Arc::make_mut(thread).status = status;
+                        match status {
+                            AgentThreadStatus::Running => has_running_threads = true,
+                            AgentThreadStatus::WaitingForConfirmation => waiting_thread_count += 1,
+                            AgentThreadStatus::Completed
+                            | AgentThreadStatus::Error
+                            | AgentThreadStatus::Unconfirmed => {}
                         }
                     }
 
@@ -1831,7 +1864,9 @@ impl Sidebar {
                     b_time.cmp(&a_time)
                 });
             } else {
+                let mut live_session_ids: HashSet<acp::SessionId> = HashSet::default();
                 for info in live_infos {
+                    live_session_ids.insert(info.session_id.clone());
                     if info.status == AgentThreadStatus::Running {
                         has_running_threads = true;
                     }
@@ -1858,6 +1893,58 @@ impl Sidebar {
                             && old_status == Some(AgentThreadStatus::Running)
                         {
                             notified_threads.insert(thread_id);
+                        }
+                    }
+                }
+
+                // Imported sessions have no conversation view, but their
+                // activity still drives the collapsed group's status.
+                if let Some(activity_store) = SessionActivityStore::try_global(cx) {
+                    let store = ThreadMetadataStore::global(cx).read(cx);
+                    let mut seen_sessions: HashSet<acp::SessionId> = HashSet::default();
+                    let mut count_imported = |metadata: &ThreadMetadata| {
+                        let Some(session_id) = metadata.session_id.as_ref() else {
+                            return;
+                        };
+                        if live_session_ids.contains(session_id)
+                            || !seen_sessions.insert(session_id.clone())
+                        {
+                            return;
+                        }
+                        let Some(status) = activity_store
+                            .read(cx)
+                            .status(&SessionSource::of_thread(metadata), session_id)
+                        else {
+                            return;
+                        };
+                        match status {
+                            AgentThreadStatus::Running => has_running_threads = true,
+                            AgentThreadStatus::WaitingForConfirmation => waiting_thread_count += 1,
+                            AgentThreadStatus::Completed
+                            | AgentThreadStatus::Error
+                            | AgentThreadStatus::Unconfirmed => {}
+                        }
+                    };
+                    for metadata in store
+                        .entries_for_main_worktree_path(group_key.path_list(), group_host.as_ref())
+                        .chain(store.entries_for_path(group_key.path_list(), group_host.as_ref()))
+                    {
+                        count_imported(metadata);
+                    }
+                    for worktree_path_list in &linked_worktree_path_lists {
+                        for metadata in
+                            store.entries_for_path(worktree_path_list, group_host.as_ref())
+                        {
+                            count_imported(metadata);
+                        }
+                    }
+                    for workspace in group_workspaces {
+                        let paths = workspace_path_list(workspace, cx);
+                        if paths.paths().is_empty() {
+                            continue;
+                        }
+                        for metadata in store.entries_for_path(&paths, group_host.as_ref()) {
+                            count_imported(metadata);
                         }
                     }
                 }
@@ -8189,6 +8276,36 @@ impl Render for Sidebar {
     }
 }
 
+fn agent_thread_status(
+    thread: &acp_thread::AcpThread,
+    has_pending_tool_call: bool,
+) -> AgentThreadStatus {
+    if thread.uses_reported_activity() {
+        // A local permission card is not evidence that the whole workflow is
+        // blocked; only the agent's aggregate state can say that.
+        return match thread.foreground_activity() {
+            ForegroundActivity::Running => AgentThreadStatus::Running,
+            ForegroundActivity::RequiresAction => AgentThreadStatus::WaitingForConfirmation,
+            ForegroundActivity::Idle if thread.had_error() => AgentThreadStatus::Error,
+            ForegroundActivity::Idle => AgentThreadStatus::Completed,
+            ForegroundActivity::Unconfirmed | ForegroundActivity::Unknown => {
+                AgentThreadStatus::Unconfirmed
+            }
+        };
+    }
+    if has_pending_tool_call {
+        AgentThreadStatus::WaitingForConfirmation
+    } else if thread.had_error() {
+        AgentThreadStatus::Error
+    } else {
+        match thread.status() {
+            ThreadStatus::Unconfirmed => AgentThreadStatus::Unconfirmed,
+            ThreadStatus::Generating => AgentThreadStatus::Running,
+            ThreadStatus::Idle => AgentThreadStatus::Completed,
+        }
+    }
+}
+
 fn all_thread_infos_for_workspace(
     workspace: &Entity<Workspace>,
     cx: &App,
@@ -8220,17 +8337,7 @@ fn all_thread_infos_for_workspace(
             let session_id = thread.session_id().clone();
             let is_background = agent_panel.is_retained_thread(&conversation_thread_id);
 
-            let status = if has_pending_tool_call {
-                AgentThreadStatus::WaitingForConfirmation
-            } else if thread.had_error() {
-                AgentThreadStatus::Error
-            } else {
-                match thread.status() {
-                    ThreadStatus::Unconfirmed => AgentThreadStatus::Unconfirmed,
-                    ThreadStatus::Generating => AgentThreadStatus::Running,
-                    ThreadStatus::Idle => AgentThreadStatus::Completed,
-                }
-            };
+            let status = agent_thread_status(thread, has_pending_tool_call);
 
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
 

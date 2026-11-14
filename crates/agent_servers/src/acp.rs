@@ -10,6 +10,7 @@ use debug_log::AcpDebugLog;
 pub use debug_log::{AcpDebugMessage, AcpDebugMessageContent, AcpDebugMessageDirection};
 use session_updates::{InboundSessionNotification, InboundSessionUpdate, PendingSessionUpdates};
 pub use terminal_updates::{DecodedTerminalNotification, DecodedTerminalUpdate};
+use v1::session_state::SessionStateExtension;
 #[cfg(any(test, feature = "test-support"))]
 pub use v1::test_support;
 pub use v1::{AcpConnection, AcpSessionList, GEMINI_TERMINAL_AUTH_METHOD_ID};
@@ -252,6 +253,9 @@ struct ClientContext {
     /// A v1 agent may only send `subagent_update` after Zed advertises the `subagents`
     /// client capability. v2 includes subagents in every session.
     accepts_subagent_updates: bool,
+    /// Whether the agent advertises the Gorynych session-state extension, and
+    /// notifications that arrived before their session was registered.
+    session_state: Rc<RefCell<SessionStateExtension>>,
 }
 
 fn dispatch_queue_closed_error() -> acp::Error {
@@ -294,6 +298,7 @@ impl ForegroundWorkItem for ClientDisconnectWork {
         if let Some(pending) = &context.pending_session_updates {
             pending.borrow_mut().clear();
         }
+        context.session_state.borrow_mut().clear();
         let threads = context
             .sessions
             .borrow()
@@ -304,6 +309,7 @@ impl ForegroundWorkItem for ClientDisconnectWork {
             if let Some(thread) = thread.upgrade() {
                 thread.update(cx, |thread, cx| {
                     thread.cancel_outstanding_elicitations(cx);
+                    thread.mark_session_state_unknown(cx);
                     thread.handle_connection_lost(cx);
                     cx.notify();
                 });
