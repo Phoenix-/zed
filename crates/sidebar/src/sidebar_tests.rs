@@ -16718,6 +16718,8 @@ async fn test_imported_session_activity_shows_without_a_loaded_conversation(
                         revision,
                         background: None,
                         background_known: None,
+                        background_malformed: false,
+                        background_known_malformed: false,
                     }),
                     cx,
                 );
@@ -16752,6 +16754,20 @@ async fn test_imported_session_activity_shows_without_a_loaded_conversation(
 
     set_state(ReportedSessionState::Idle, 3, cx);
     assert_eq!(status(cx), AgentThreadStatus::Completed);
+    cx.update(|_, cx| {
+        let store = SessionActivityStore::try_global(cx).expect("activity store");
+        store.update(cx, |store, cx| {
+            let snapshot = SessionStateSnapshot::from_value(&serde_json::json!({
+                "state": "idle", "epoch": "conductor", "revision": 4,
+                "backgroundKnown": [{"type":"_codex_terminal"}]
+            }))
+            .expect("valid activity");
+            store.set_live_snapshot(&source, session_id.clone(), Some(snapshot), cx);
+        });
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+    assert_eq!(status(cx), AgentThreadStatus::Background);
 }
 
 #[gpui::test]
@@ -16787,6 +16803,8 @@ async fn test_imported_session_disconnect_is_unconfirmed_and_rebinds(cx: &mut Te
                             revision,
                             background: None,
                             background_known: None,
+                            background_malformed: false,
+                            background_known_malformed: false,
                         }),
                         cx,
                     );
@@ -16874,6 +16892,8 @@ async fn test_loaded_extension_thread_uses_aggregate_activity(cx: &mut TestAppCo
                     revision: 1,
                     background: None,
                     background_known: None,
+                    background_malformed: false,
+                    background_known_malformed: false,
                 },
                 cx,
             )
@@ -16903,6 +16923,8 @@ async fn test_loaded_extension_thread_uses_aggregate_activity(cx: &mut TestAppCo
                     revision: 2,
                     background: None,
                     background_known: None,
+                    background_malformed: false,
+                    background_known_malformed: false,
                 },
                 cx,
             )
@@ -16985,6 +17007,8 @@ async fn test_collapsed_project_counts_imported_session_activity(cx: &mut TestAp
                     revision: 1,
                     background: None,
                     background_known: None,
+                    background_malformed: false,
+                    background_known_malformed: false,
                 }),
                 cx,
             );
@@ -16997,6 +17021,8 @@ async fn test_collapsed_project_counts_imported_session_activity(cx: &mut TestAp
                     revision: 1,
                     background: None,
                     background_known: None,
+                    background_malformed: false,
+                    background_known_malformed: false,
                 }),
                 cx,
             );

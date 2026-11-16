@@ -58,6 +58,8 @@ pub struct SessionStateSnapshot {
     pub revision: u64,
     pub background: Option<Vec<Value>>,
     pub background_known: Option<Vec<Value>>,
+    pub background_malformed: bool,
+    pub background_known_malformed: bool,
 }
 
 impl SessionStateSnapshot {
@@ -106,8 +108,8 @@ impl SessionStateSnapshot {
         }
     }
 
-    /// Parses a snapshot object. Anything malformed is not a snapshot, which callers
-    /// treat as unconfirmed activity rather than idle.
+    /// Parses a snapshot. A malformed foreground envelope is unconfirmed; malformed
+    /// background fields are independently treated as unreported.
     pub fn from_value(value: &Value) -> Option<Self> {
         let object = value.as_object()?;
         let state = object
@@ -121,8 +123,18 @@ impl SessionStateSnapshot {
         let revision = object.get("revision")?.as_u64()?;
         let background = Self::parse_background(object.get("background"));
         let background_known = Self::parse_background(object.get("backgroundKnown"));
+        let background_malformed = object
+            .get("background")
+            .is_some_and(|value| !value.is_null())
+            && background.is_none();
+        let background_known_malformed = object
+            .get("backgroundKnown")
+            .is_some_and(|value| !value.is_null())
+            && background_known.is_none();
         Some(Self {
             background,
+            background_malformed,
+            background_known_malformed,
             background_known,
             state,
             epoch: epoch.to_owned(),
@@ -191,10 +203,35 @@ impl SessionStateReconciler {
             self.last_snapshot = Some(snapshot.clone());
             return true;
         }
-        // A malformed notification clears confirmation without advancing the
-        // revision. An exactly matching snapshot may restore it; a conflicting
-        // state at the same revision may not.
-        snapshot.revision == self.revision && self.last_snapshot.as_ref() == Some(snapshot)
+        if snapshot.revision != self.revision {
+            return false;
+        }
+        let Some(last) = self.last_snapshot.as_mut() else {
+            return false;
+        };
+        if snapshot.state != last.state {
+            return false;
+        }
+        if !(snapshot.background_malformed
+            || last.background_malformed
+            || snapshot.background == last.background)
+            || !(snapshot.background_known_malformed
+                || last.background_known_malformed
+                || snapshot.background_known == last.background_known)
+        {
+            return false;
+        }
+        // Malformed fields invalidate only their own presentation. Keep the last
+        // confirmed value for same-revision conflict detection and recovery.
+        if last.background_malformed && !snapshot.background_malformed {
+            last.background = snapshot.background.clone();
+            last.background_malformed = false;
+        }
+        if last.background_known_malformed && !snapshot.background_known_malformed {
+            last.background_known = snapshot.background_known.clone();
+            last.background_known_malformed = false;
+        }
+        true
     }
 
     fn bind(&mut self, snapshot: &SessionStateSnapshot) {
@@ -246,6 +283,8 @@ mod tests {
             revision,
             background: None,
             background_known: None,
+            background_malformed: false,
+            background_known_malformed: false,
         }
     }
 
@@ -301,6 +340,28 @@ mod tests {
         .expect("valid foreground remains confirmed");
         assert_eq!(malformed.state, ReportedSessionState::Idle);
         assert_eq!(malformed.background, None);
+    }
+
+    #[test]
+    fn malformed_background_invalidates_only_that_field_and_can_recover() {
+        let parse = |background| {
+            SessionStateSnapshot::from_value(&json!({
+                "state": "idle", "epoch": "one", "revision": 4, "background": background,
+                "backgroundKnown": [{"type":"tool_call", "toolCallId":"known"}]
+            }))
+            .expect("valid foreground")
+        };
+        let good = parse(json!([{"type":"terminal", "terminalId":"one"}]));
+        let malformed = parse(json!([{}]));
+        let conflicting = parse(json!([{"type":"terminal", "terminalId":"other"}]));
+        let mut reconciler = SessionStateReconciler::default();
+        assert!(reconciler.accept_live(&good));
+        assert!(reconciler.accept_live(&malformed));
+        assert_eq!(malformed.state, ReportedSessionState::Idle);
+        assert!(malformed.background.is_none());
+        assert!(malformed.background_known.is_some());
+        assert!(!reconciler.accept_snapshot(&conflicting));
+        assert!(reconciler.accept_snapshot(&good));
     }
 
     #[test]

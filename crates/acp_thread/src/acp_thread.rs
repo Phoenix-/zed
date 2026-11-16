@@ -11920,6 +11920,8 @@ mod tests {
             revision,
             background: None,
             background_known: None,
+            background_malformed: false,
+            background_known_malformed: false,
         }
     }
 

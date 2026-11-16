@@ -220,6 +220,8 @@ mod tests {
                 revision: 2,
                 background: None,
                 background_known: None,
+                background_malformed: false,
+                background_known_malformed: false,
             }),
         );
         extension.record_pending(
@@ -230,6 +232,8 @@ mod tests {
                 revision: 1,
                 background: None,
                 background_known: None,
+                background_malformed: false,
+                background_known_malformed: false,
             }),
         );
         assert_eq!(
@@ -251,6 +255,8 @@ mod tests {
                 revision: 5,
                 background: None,
                 background_known: None,
+                background_malformed: false,
+                background_known_malformed: false,
             }),
         );
         extension.record_pending(
@@ -261,6 +267,8 @@ mod tests {
                 revision: 1,
                 background: None,
                 background_known: None,
+                background_malformed: false,
+                background_known_malformed: false,
             }),
         );
         extension.record_pending(
@@ -271,6 +279,8 @@ mod tests {
                 revision: 6,
                 background: None,
                 background_known: None,
+                background_malformed: false,
+                background_known_malformed: false,
             }),
         );
         assert_eq!(

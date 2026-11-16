@@ -236,6 +236,8 @@ mod tests {
             revision,
             background: None,
             background_known: None,
+            background_malformed: false,
+            background_known_malformed: false,
         }
     }
 
@@ -319,6 +321,48 @@ mod tests {
         assert_eq!(
             store.read_with(cx, |store, _| store.status(&source, &session_id)),
             Some(AgentThreadStatus::Completed)
+        );
+    }
+
+    #[gpui::test]
+    fn malformed_background_preserves_foreground_and_recovers_at_same_revision(
+        cx: &mut TestAppContext,
+    ) {
+        let store = cx.new(|_| SessionActivityStore::default());
+        let source = local("gorynych");
+        let id = acp::SessionId::new("s");
+        let parse = |background| {
+            SessionStateSnapshot::from_value(&serde_json::json!({
+                "state": "idle", "epoch": "one", "revision": 4, "background": background
+            }))
+            .expect("valid foreground")
+        };
+        let good = parse(serde_json::json!([{"type":"terminal","terminalId":"one"}]));
+        let malformed = parse(serde_json::json!([{}]));
+        let conflicting = parse(serde_json::json!([{"type":"terminal","terminalId":"other"}]));
+        store.update(cx, |store, cx| {
+            store.set_live_snapshot(&source, id.clone(), Some(good.clone()), cx)
+        });
+        store.update(cx, |store, cx| {
+            store.set_live_snapshot(&source, id.clone(), Some(malformed), cx)
+        });
+        assert_eq!(
+            store.read_with(cx, |store, _| store.status(&source, &id)),
+            Some(AgentThreadStatus::Completed)
+        );
+        store.update(cx, |store, cx| {
+            store.set_live_snapshot(&source, id.clone(), Some(conflicting), cx)
+        });
+        assert_eq!(
+            store.read_with(cx, |store, _| store.status(&source, &id)),
+            Some(AgentThreadStatus::Completed)
+        );
+        store.update(cx, |store, cx| {
+            store.set_live_snapshot(&source, id.clone(), Some(good), cx)
+        });
+        assert_eq!(
+            store.read_with(cx, |store, _| store.status(&source, &id)),
+            Some(AgentThreadStatus::Background)
         );
     }
 
@@ -474,6 +518,8 @@ mod tests {
                         revision: 7,
                         background: None,
                         background_known: None,
+                        background_malformed: false,
+                        background_known_malformed: false,
                     }),
                 )],
                 true,
@@ -514,6 +560,8 @@ mod tests {
                         revision: 8,
                         background: None,
                         background_known: None,
+                        background_malformed: false,
+                        background_known_malformed: false,
                     }),
                 )],
                 true,
