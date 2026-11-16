@@ -4318,7 +4318,8 @@ impl AcpThread {
         self.reported_activity = true;
         self.session_state.reset();
         let previous = self.foreground_activity();
-        let background_changed = self.reported_background.take().is_some();
+        let background_changed = self.reported_background.take().is_some()
+            | self.reported_background_known.take().is_some();
         self.activity.mark_unconfirmed();
         if background_changed || previous != self.foreground_activity() {
             cx.emit(AcpThreadEvent::StatusChanged);
@@ -12236,6 +12237,12 @@ mod tests {
             );
             assert_eq!(thread.reported_background_count(), Some(1));
             assert_eq!(thread.foreground_activity(), ForegroundActivity::Idle);
+
+            thread.reported_activity = false;
+            thread.enable_reported_activity(cx);
+            assert_eq!(thread.reported_background_count(), None);
+            assert!(!thread.reported_background_is_partial());
+            assert_eq!(thread.foreground_activity(), ForegroundActivity::Unconfirmed);
         });
     }
 
