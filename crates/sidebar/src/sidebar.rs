@@ -3120,6 +3120,7 @@ impl Sidebar {
                             .w(rems(4.0))
                             .flex_shrink_0()
                             .justify_end()
+                            .pr_1p5()
                             .when(!is_selected && !is_menu_open, |row| {
                                 row.visible_on_hover(&group_name)
                             })
