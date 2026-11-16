@@ -37,7 +37,7 @@ use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
     FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
     TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
-    linear_gradient, list, prelude::*, px,
+    linear_gradient, list, prelude::*, px, rems,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -865,6 +865,7 @@ pub struct Sidebar {
     restoring_tasks: HashMap<agent_ui::ThreadId, Task<()>>,
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
     project_header_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
+    session_group_menu_handles: HashMap<SessionGroupKey, PopoverMenuHandle<ContextMenu>>,
     project_header_new_thread_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
     project_header_menu_ix: Option<usize>,
     worktree_default_branches: HashMap<ProjectGroupKey, DefaultBranchCache>,
@@ -1028,6 +1029,7 @@ impl Sidebar {
             restoring_tasks: HashMap::new(),
             recent_projects_popover_handle: PopoverMenuHandle::default(),
             project_header_menu_handles: HashMap::new(),
+            session_group_menu_handles: HashMap::new(),
             project_header_new_thread_menu_handles: HashMap::new(),
             project_header_menu_ix: None,
             worktree_default_branches: HashMap::new(),
@@ -2967,6 +2969,13 @@ impl Sidebar {
                     Label::new(name.clone()).truncate().into_any_element()
                 };
                 let menu_key = key.clone();
+                let group_name = SharedString::from(format!("session-group-hover-{ix}"));
+                let menu_handle = self
+                    .session_group_menu_handles
+                    .entry(key.clone())
+                    .or_default()
+                    .clone();
+                let is_menu_open = menu_handle.is_deployed();
                 let sidebar = cx.weak_entity();
                 let project =
                     self.contents.entries[..ix]
@@ -2998,6 +3007,13 @@ impl Sidebar {
                 });
                 let menu = (!key.group_id.is_empty()).then(|| {
                     PopoverMenu::new(SharedString::from(format!("session-group-menu-{ix}")))
+                        .with_handle(menu_handle)
+                        .on_open(Rc::new({
+                            let sidebar = sidebar.clone();
+                            move |_, cx| {
+                                sidebar.update(cx, |_, cx| cx.notify()).ok();
+                            }
+                        }))
                         .trigger(
                             IconButton::new(
                                 SharedString::from(format!("session-group-actions-{ix}")),
@@ -3041,52 +3057,72 @@ impl Sidebar {
                 });
                 h_flex()
                     .id(SharedString::from(format!("session-group-{ix}")))
-                    .pl_4()
+                    .group(&group_name)
+                    .px_1p5()
                     .h(Tab::content_height(cx))
                     .w_full()
                     .border_1()
+                    .border_l_2()
+                    .border_r_2()
                     .border_color(if is_selected {
                         cx.theme().colors().panel_focused_border
                     } else {
                         gpui::transparent_black()
                     })
-                    .gap_1()
                     .cursor_pointer()
                     .child(
-                        Icon::new(if collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .size(IconSize::Small),
-                    )
-                    .child(div().min_w_0().flex_1().child(group_label))
-                    .when(collapsed && *has_running, |row| {
-                        row.child(
-                            Icon::new(IconName::LoadCircle)
-                                .size(IconSize::XSmall)
-                                .with_rotate_animation(2),
-                        )
-                    })
-                    .when(collapsed && *has_waiting, |row| {
-                        row.child(
-                            Icon::new(IconName::Warning)
-                                .size(IconSize::XSmall)
-                                .color(Color::Warning),
-                        )
-                    })
-                    .when(
-                        collapsed && *has_notifications && !*has_running && !*has_waiting,
-                        |row| {
-                            row.child(
-                                Icon::new(IconName::Circle)
-                                    .size(IconSize::Small)
-                                    .color(Color::Accent),
+                        h_flex()
+                            .w(rems(4.0))
+                            .flex_shrink_0()
+                            .gap_1()
+                            .child(
+                                Icon::new(if collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .size(IconSize::Small),
                             )
-                        },
+                            .when(collapsed && *has_running, |row| {
+                                row.child(
+                                    Icon::new(IconName::LoadCircle)
+                                        .size(IconSize::XSmall)
+                                        .with_rotate_animation(2),
+                                )
+                            })
+                            .when(collapsed && *has_waiting, |row| {
+                                row.child(
+                                    Icon::new(IconName::Warning)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Warning),
+                                )
+                            })
+                            .when(
+                                collapsed && *has_notifications && !*has_running && !*has_waiting,
+                                |row| {
+                                    row.child(
+                                        Icon::new(IconName::Circle)
+                                            .size(IconSize::Small)
+                                            .color(Color::Accent),
+                                    )
+                                },
+                            ),
                     )
                     .child(
                         h_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .justify_center()
+                            .child(group_label),
+                    )
+                    .child(
+                        h_flex()
+                            .w(rems(4.0))
+                            .flex_shrink_0()
+                            .justify_end()
+                            .when(!is_selected && !is_menu_open, |row| {
+                                row.visible_on_hover(&group_name)
+                            })
                             .children(new_thread_button)
                             .children(menu)
                             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
