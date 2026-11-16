@@ -2345,7 +2345,8 @@ impl Sidebar {
                         match status {
                             AgentThreadStatus::Running => has_running_threads = true,
                             AgentThreadStatus::WaitingForConfirmation => waiting_thread_count += 1,
-                            AgentThreadStatus::Completed
+                            AgentThreadStatus::Background
+                            | AgentThreadStatus::Completed
                             | AgentThreadStatus::Error
                             | AgentThreadStatus::Unconfirmed => {}
                         }
@@ -2436,7 +2437,8 @@ impl Sidebar {
                         match status {
                             AgentThreadStatus::Running => has_running_threads = true,
                             AgentThreadStatus::WaitingForConfirmation => waiting_thread_count += 1,
-                            AgentThreadStatus::Completed
+                            AgentThreadStatus::Background
+                            | AgentThreadStatus::Completed
                             | AgentThreadStatus::Error
                             | AgentThreadStatus::Unconfirmed => {}
                         }
@@ -6767,7 +6769,9 @@ impl Sidebar {
                     | AgentThreadStatus::Unconfirmed => {
                         return;
                     }
-                    AgentThreadStatus::Completed | AgentThreadStatus::Error => {}
+                    AgentThreadStatus::Background
+                    | AgentThreadStatus::Completed
+                    | AgentThreadStatus::Error => {}
                 }
                 if thread.draft.is_some() {
                     let workspace = thread.workspace.clone();
@@ -9230,6 +9234,13 @@ fn agent_thread_status(
             ForegroundActivity::Running => AgentThreadStatus::Running,
             ForegroundActivity::RequiresAction => AgentThreadStatus::WaitingForConfirmation,
             ForegroundActivity::Idle if thread.had_error() => AgentThreadStatus::Error,
+            ForegroundActivity::Idle
+                if thread
+                    .reported_background_count()
+                    .is_some_and(|count| count > 0) =>
+            {
+                AgentThreadStatus::Background
+            }
             ForegroundActivity::Idle => AgentThreadStatus::Completed,
             ForegroundActivity::Unconfirmed | ForegroundActivity::Unknown => {
                 AgentThreadStatus::Unconfirmed

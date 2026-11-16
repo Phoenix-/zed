@@ -6,7 +6,7 @@
 
 use agent_client_protocol::schema::v2 as acp_v2;
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 /// Key in the `_meta` of agent capabilities, listed sessions, and session-open
 /// responses that advertises or carries this extension.
@@ -56,11 +56,54 @@ pub struct SessionStateSnapshot {
     pub state: ReportedSessionState,
     pub epoch: String,
     pub revision: u64,
+    pub background: Option<Vec<Value>>,
+    pub background_known: Option<Vec<Value>>,
 }
 
 impl SessionStateSnapshot {
     pub fn from_meta(meta: Option<&acp_v2::Meta>) -> Option<Self> {
         Self::from_value(meta?.get(SESSION_STATE_META_KEY)?)
+    }
+
+    fn parse_background(value: Option<&Value>) -> Option<Vec<Value>> {
+        let mut seen = HashSet::new();
+        match value {
+            Some(Value::Array(tasks))
+                if tasks.iter().all(|task| {
+                    let Some(object) = task.as_object() else {
+                        return false;
+                    };
+                    let Some(kind) = object
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .filter(|kind| !kind.trim().is_empty())
+                    else {
+                        return false;
+                    };
+                    if object
+                        .get("_meta")
+                        .is_some_and(|meta| !meta.is_null() && !meta.is_object())
+                    {
+                        return false;
+                    }
+                    let field = match kind {
+                        "terminal" => Some("terminalId"),
+                        "tool_call" => Some("toolCallId"),
+                        "subagent" => Some("sessionId"),
+                        _ => None,
+                    };
+                    field.is_none_or(|field| {
+                        object
+                            .get(field)
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !id.trim().is_empty() && seen.insert((kind, id)))
+                    })
+                }) =>
+            {
+                Some(tasks.clone())
+            }
+            _ => None,
+        }
     }
 
     /// Parses a snapshot object. Anything malformed is not a snapshot, which callers
@@ -76,7 +119,11 @@ impl SessionStateSnapshot {
             return None;
         }
         let revision = object.get("revision")?.as_u64()?;
+        let background = Self::parse_background(object.get("background"));
+        let background_known = Self::parse_background(object.get("backgroundKnown"));
         Some(Self {
+            background,
+            background_known,
             state,
             epoch: epoch.to_owned(),
             revision,
@@ -93,7 +140,7 @@ impl SessionStateSnapshot {
 pub struct SessionStateReconciler {
     epoch: Option<String>,
     revision: u64,
-    last_state: Option<ReportedSessionState>,
+    last_snapshot: Option<SessionStateSnapshot>,
     retired_epochs: VecDeque<String>,
 }
 
@@ -141,19 +188,19 @@ impl SessionStateReconciler {
     fn accept_current(&mut self, snapshot: &SessionStateSnapshot) -> bool {
         if snapshot.revision > self.revision {
             self.revision = snapshot.revision;
-            self.last_state = Some(snapshot.state);
+            self.last_snapshot = Some(snapshot.clone());
             return true;
         }
         // A malformed notification clears confirmation without advancing the
         // revision. An exactly matching snapshot may restore it; a conflicting
         // state at the same revision may not.
-        snapshot.revision == self.revision && self.last_state == Some(snapshot.state)
+        snapshot.revision == self.revision && self.last_snapshot.as_ref() == Some(snapshot)
     }
 
     fn bind(&mut self, snapshot: &SessionStateSnapshot) {
         self.epoch = Some(snapshot.epoch.clone());
         self.revision = snapshot.revision;
-        self.last_state = Some(snapshot.state);
+        self.last_snapshot = Some(snapshot.clone());
     }
 
     fn retire(&mut self, epoch: String) {
@@ -174,7 +221,7 @@ impl SessionStateReconciler {
     pub fn reset(&mut self) {
         self.epoch = None;
         self.revision = 0;
-        self.last_state = None;
+        self.last_snapshot = None;
         self.retired_epochs.clear();
     }
 
@@ -197,6 +244,8 @@ mod tests {
             state,
             epoch: epoch.into(),
             revision,
+            background: None,
+            background_known: None,
         }
     }
 
@@ -226,6 +275,32 @@ mod tests {
         ] {
             assert_eq!(SessionStateSnapshot::from_value(&malformed), None);
         }
+    }
+
+    #[test]
+    fn background_snapshots_reconcile_as_part_of_the_revision() {
+        let parse = |background| {
+            SessionStateSnapshot::from_value(&json!({
+                "state": "idle", "epoch": "one", "revision": 2, "background": background
+            }))
+            .expect("valid snapshot")
+        };
+        let unknown = parse(json!(null));
+        let empty = parse(json!([]));
+        let busy = parse(json!([{ "type": "terminal", "terminalId": "task" }]));
+        assert_eq!(unknown.background, None);
+        assert_eq!(empty.background.as_ref().map(Vec::len), Some(0));
+        assert_eq!(busy.background.as_ref().map(Vec::len), Some(1));
+        let mut reconciler = SessionStateReconciler::default();
+        assert!(reconciler.accept_live(&busy));
+        assert!(!reconciler.accept_snapshot(&empty));
+        assert!(reconciler.accept_snapshot(&busy));
+        let malformed = SessionStateSnapshot::from_value(&json!({
+            "state": "idle", "epoch": "one", "revision": 3, "background": [{}]
+        }))
+        .expect("valid foreground remains confirmed");
+        assert_eq!(malformed.state, ReportedSessionState::Idle);
+        assert_eq!(malformed.background, None);
     }
 
     #[test]

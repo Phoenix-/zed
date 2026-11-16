@@ -218,6 +218,8 @@ mod tests {
                 state: ReportedSessionState::Running,
                 epoch: "one".into(),
                 revision: 2,
+                background: None,
+                background_known: None,
             }),
         );
         extension.record_pending(
@@ -226,6 +228,8 @@ mod tests {
                 state: ReportedSessionState::Idle,
                 epoch: "one".into(),
                 revision: 1,
+                background: None,
+                background_known: None,
             }),
         );
         assert_eq!(
@@ -245,6 +249,8 @@ mod tests {
                 state: ReportedSessionState::Running,
                 epoch: "one".into(),
                 revision: 5,
+                background: None,
+                background_known: None,
             }),
         );
         extension.record_pending(
@@ -253,6 +259,8 @@ mod tests {
                 state: ReportedSessionState::Idle,
                 epoch: "two".into(),
                 revision: 1,
+                background: None,
+                background_known: None,
             }),
         );
         extension.record_pending(
@@ -261,6 +269,8 @@ mod tests {
                 state: ReportedSessionState::Running,
                 epoch: "one".into(),
                 revision: 6,
+                background: None,
+                background_known: None,
             }),
         );
         assert_eq!(

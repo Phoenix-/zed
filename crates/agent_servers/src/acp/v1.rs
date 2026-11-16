@@ -9333,6 +9333,8 @@ exit 7
                             state: ReportedSessionState::RequiresAction,
                             epoch: "conductor".into(),
                             revision: 4,
+                            background: None,
+                            background_known: None,
                         },
                         cx,
                     )

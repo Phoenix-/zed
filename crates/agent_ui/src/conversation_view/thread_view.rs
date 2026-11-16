@@ -5810,7 +5810,36 @@ impl ThreadView {
     }
 
     fn render_activity_status_label(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
-        let (id, label, tooltip) = match self.thread.read(cx).foreground_activity() {
+        let thread = self.thread.read(cx);
+        if thread.foreground_activity() == ForegroundActivity::Idle {
+            if let Some(count) = thread
+                .reported_background_count()
+                .filter(|count| *count > 0)
+            {
+                return Some(
+                    div()
+                        .id("activity-background")
+                        .child(
+                            Label::new(format!(
+                                "Foreground ended, {}{count} background task{} remain{}",
+                                if thread.reported_background_is_partial() {
+                                    "at least "
+                                } else {
+                                    ""
+                                },
+                                if count == 1 { "" } else { "s" },
+                                if count == 1 { "s" } else { "" }
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .tooltip(Tooltip::text(
+                            "The foreground response ended; background work remains.",
+                        )),
+                );
+            }
+        }
+        let (id, label, tooltip) = match thread.foreground_activity() {
             ForegroundActivity::Unconfirmed => (
                 "activity-unconfirmed",
                 "Activity unconfirmed",

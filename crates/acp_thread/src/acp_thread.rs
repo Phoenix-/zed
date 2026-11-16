@@ -3627,6 +3627,8 @@ pub struct AcpThread {
     /// extension rather than from Zed's own prompt turns.
     reported_activity: bool,
     session_state: SessionStateReconciler,
+    reported_background: Option<Vec<serde_json::Value>>,
+    reported_background_known: Option<Vec<serde_json::Value>>,
     reported_usage: Option<ReportedTokenUsage>,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
@@ -3991,6 +3993,8 @@ impl AcpThread {
             received_session_state: false,
             reported_activity: false,
             session_state: SessionStateReconciler::default(),
+            reported_background: None,
+            reported_background_known: None,
             reported_usage: None,
             connection,
             token_usage: None,
@@ -4314,8 +4318,9 @@ impl AcpThread {
         self.reported_activity = true;
         self.session_state.reset();
         let previous = self.foreground_activity();
+        let background_changed = self.reported_background.take().is_some();
         self.activity.mark_unconfirmed();
-        if previous != self.foreground_activity() {
+        if background_changed || previous != self.foreground_activity() {
             cx.emit(AcpThreadEvent::StatusChanged);
         }
         cx.notify();
@@ -4359,7 +4364,15 @@ impl AcpThread {
         if !accepted {
             return Ok(false);
         }
+        let background_changed = self.reported_background != snapshot.background
+            || self.reported_background_known != snapshot.background_known;
+        self.reported_background = snapshot.background;
+        self.reported_background_known = snapshot.background_known;
         self.update_session_state(snapshot.state.activity(), cx)?;
+        if background_changed {
+            cx.emit(AcpThreadEvent::StatusChanged);
+        }
+        cx.notify();
         Ok(true)
     }
 
@@ -4370,8 +4383,10 @@ impl AcpThread {
             return;
         }
         let previous = self.foreground_activity();
+        let background_changed = self.reported_background.take().is_some()
+            | self.reported_background_known.take().is_some();
         self.activity.mark_unconfirmed();
-        if previous != self.foreground_activity() {
+        if background_changed || previous != self.foreground_activity() {
             cx.emit(AcpThreadEvent::StatusChanged);
             cx.notify();
         }
@@ -4380,6 +4395,17 @@ impl AcpThread {
     /// A reconnect gets a new epoch even for the same session.
     pub fn reset_session_state_epoch(&mut self) {
         self.session_state.reset();
+    }
+
+    pub fn reported_background_count(&self) -> Option<usize> {
+        self.reported_background
+            .as_ref()
+            .or(self.reported_background_known.as_ref())
+            .map(Vec::len)
+    }
+
+    pub fn reported_background_is_partial(&self) -> bool {
+        self.reported_background.is_none() && self.reported_background_known.is_some()
     }
 
     pub fn foreground_state(&self) -> Option<&acp_v2::StateUpdate> {
@@ -11892,6 +11918,8 @@ mod tests {
             state,
             epoch: epoch.into(),
             revision,
+            background: None,
+            background_known: None,
         }
     }
 
@@ -12178,6 +12206,35 @@ mod tests {
             thread.read_with(cx, |thread, _| thread.status()),
             ThreadStatus::Idle
         );
+    }
+
+    #[gpui::test]
+    async fn background_confirmation_is_cleared_and_matching_snapshot_restores_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _connection) = new_session_state_test_thread(cx).await;
+        let mut snapshot = session_state(ReportedSessionState::Idle, "one", 2);
+        snapshot.background_known = Some(vec![serde_json::json!({"type":"_task"})]);
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_live_session_state(snapshot.clone(), cx)
+                .expect("partial snapshot");
+            assert_eq!(thread.reported_background_count(), Some(1));
+            assert!(thread.reported_background_is_partial());
+            thread.mark_session_state_unknown(cx);
+            assert_eq!(thread.reported_background_count(), None);
+            assert_eq!(
+                thread.foreground_activity(),
+                ForegroundActivity::Unconfirmed
+            );
+            assert!(
+                thread
+                    .apply_session_state_snapshot(snapshot, cx)
+                    .expect("same snapshot")
+            );
+            assert_eq!(thread.reported_background_count(), Some(1));
+            assert_eq!(thread.foreground_activity(), ForegroundActivity::Idle);
+        });
     }
 
     #[gpui::test]

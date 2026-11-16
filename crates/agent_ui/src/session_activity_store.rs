@@ -58,6 +58,15 @@ impl SessionActivityStore {
         Some(match &entry.snapshot {
             Some(snapshot) => match snapshot.state {
                 ReportedSessionState::Running => AgentThreadStatus::Running,
+                ReportedSessionState::Idle
+                    if snapshot
+                        .background
+                        .as_ref()
+                        .or(snapshot.background_known.as_ref())
+                        .is_some_and(|tasks| !tasks.is_empty()) =>
+                {
+                    AgentThreadStatus::Background
+                }
                 ReportedSessionState::Idle => AgentThreadStatus::Completed,
                 ReportedSessionState::RequiresAction => AgentThreadStatus::WaitingForConfirmation,
             },
@@ -225,6 +234,8 @@ mod tests {
             state,
             epoch: epoch.into(),
             revision,
+            background: None,
+            background_known: None,
         }
     }
 
@@ -281,6 +292,34 @@ mod tests {
                 Some(AgentThreadStatus::Unconfirmed)
             );
         });
+    }
+
+    #[gpui::test]
+    fn idle_background_activity_is_visible_for_unopened_sessions(cx: &mut TestAppContext) {
+        let store = cx.new(|_| SessionActivityStore::default());
+        let source = local("gorynych");
+        let session_id = acp::SessionId::new("background");
+        let mut busy = snapshot(ReportedSessionState::Idle, 1);
+        busy.background = Some(vec![serde_json::json!({"id": "task"})]);
+        store.update(cx, |store, cx| {
+            store.set_live_snapshot(&source, session_id.clone(), Some(busy), cx)
+        });
+        assert_eq!(
+            store.read_with(cx, |store, _| store.status(&source, &session_id)),
+            Some(AgentThreadStatus::Background)
+        );
+        store.update(cx, |store, cx| {
+            store.set_live_snapshot(
+                &source,
+                session_id.clone(),
+                Some(snapshot(ReportedSessionState::Idle, 2)),
+                cx,
+            )
+        });
+        assert_eq!(
+            store.read_with(cx, |store, _| store.status(&source, &session_id)),
+            Some(AgentThreadStatus::Completed)
+        );
     }
 
     #[gpui::test]
@@ -433,6 +472,8 @@ mod tests {
                         state: ReportedSessionState::Running,
                         epoch: "one".into(),
                         revision: 7,
+                        background: None,
+                        background_known: None,
                     }),
                 )],
                 true,
@@ -471,6 +512,8 @@ mod tests {
                         state: ReportedSessionState::Running,
                         epoch: "one".into(),
                         revision: 8,
+                        background: None,
+                        background_known: None,
                     }),
                 )],
                 true,

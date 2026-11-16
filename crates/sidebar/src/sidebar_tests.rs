@@ -16716,6 +16716,8 @@ async fn test_imported_session_activity_shows_without_a_loaded_conversation(
                         state,
                         epoch: "conductor".into(),
                         revision,
+                        background: None,
+                        background_known: None,
                     }),
                     cx,
                 );
@@ -16783,6 +16785,8 @@ async fn test_imported_session_disconnect_is_unconfirmed_and_rebinds(cx: &mut Te
                             state,
                             epoch: epoch.into(),
                             revision,
+                            background: None,
+                            background_known: None,
                         }),
                         cx,
                     );
@@ -16868,6 +16872,8 @@ async fn test_loaded_extension_thread_uses_aggregate_activity(cx: &mut TestAppCo
                     state: ReportedSessionState::Running,
                     epoch: "conductor".into(),
                     revision: 1,
+                    background: None,
+                    background_known: None,
                 },
                 cx,
             )
@@ -16895,6 +16901,8 @@ async fn test_loaded_extension_thread_uses_aggregate_activity(cx: &mut TestAppCo
                     state: ReportedSessionState::RequiresAction,
                     epoch: "conductor".into(),
                     revision: 2,
+                    background: None,
+                    background_known: None,
                 },
                 cx,
             )
@@ -16975,6 +16983,8 @@ async fn test_collapsed_project_counts_imported_session_activity(cx: &mut TestAp
                     state: ReportedSessionState::Running,
                     epoch: "conductor".into(),
                     revision: 1,
+                    background: None,
+                    background_known: None,
                 }),
                 cx,
             );
@@ -16985,6 +16995,8 @@ async fn test_collapsed_project_counts_imported_session_activity(cx: &mut TestAp
                     state: ReportedSessionState::RequiresAction,
                     epoch: "conductor".into(),
                     revision: 1,
+                    background: None,
+                    background_known: None,
                 }),
                 cx,
             );

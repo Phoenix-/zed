@@ -12,6 +12,7 @@ pub enum AgentThreadStatus {
     #[default]
     Completed,
     Unconfirmed,
+    Background,
     Running,
     WaitingForConfirmation,
     Error,
@@ -331,6 +332,12 @@ impl RenderOnce for ThreadItem {
                     .size(IconSize::XSmall)
                     .color(Color::Warning),
             )
+        } else if self.status == AgentThreadStatus::Background {
+            Some(
+                Icon::new(IconName::Circle)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
         } else if self.status == AgentThreadStatus::Unconfirmed {
             Some(
                 Icon::new(IconName::Info)
@@ -355,6 +362,15 @@ impl RenderOnce for ThreadItem {
                         .color(Color::Muted)
                         .with_rotate_animation(2),
                 )
+                .into_any_element()
+        } else if self.status == AgentThreadStatus::Background {
+            icon_container()
+                .child(
+                    Icon::new(IconName::Circle)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .tooltip(Tooltip::text("Foreground ended; background work remains."))
                 .into_any_element()
         } else if let Some(status_icon) = status_icon {
             icon_container().child(status_icon).into_any_element()
