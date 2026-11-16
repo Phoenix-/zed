@@ -16582,6 +16582,7 @@ dependencies = [
  "ui",
  "unicode-segmentation",
  "util",
+ "uuid",
  "workspace",
  "zed_actions",
 ]

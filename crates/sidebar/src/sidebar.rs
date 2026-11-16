@@ -9,6 +9,7 @@ use agent_client_protocol::schema::v2 as acp;
 use agent_settings::{AgentSettings, THREADS_LIST_MAX_WIDTH, THREADS_LIST_MIN_WIDTH};
 use agent_ui::session_activity_store::SessionActivityStore;
 use agent_ui::session_auto_import::SessionSource;
+use agent_ui::session_groups::SessionGroups;
 use agent_ui::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
@@ -22,8 +23,8 @@ use agent_ui::threads_archive_view::{
 };
 use agent_ui::{
     AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentThreadSource,
-    ArchiveSelectedThread, CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE, NewTerminalThread,
-    NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
+    ArchiveSelectedThread, CreateThreadOptions, CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE,
+    NewTerminalThread, NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
     ThreadTitleRegenerationResult, channels_with_threads, import_threads_from_other_channels,
 };
 use agent_ui::{MessageEditorEvent, StateChange, thread_worktree_archive};
@@ -49,7 +50,9 @@ use project::{
     AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId, repo_identity_path_if_local,
 };
 use recent_projects::sidebar_recent_projects::SidebarRecentProjects;
-use remote::{RemoteConnectionOptions, same_remote_connection_identity};
+use remote::{
+    RemoteConnectionOptions, remote_connection_identity, same_remote_connection_identity,
+};
 use ui::utils::platform_title_bar_height;
 
 use serde::{Deserialize, Serialize};
@@ -411,8 +414,36 @@ enum ListEntry {
         is_active: bool,
         has_threads: bool,
     },
+    SessionGroupHeader {
+        key: SessionGroupKey,
+        name: SharedString,
+        has_running: bool,
+        has_waiting: bool,
+        has_notifications: bool,
+    },
     Thread(Arc<ThreadEntry>),
     Terminal(TerminalEntry),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SessionGroupKey {
+    service_id: String,
+    project_key: String,
+    group_id: String,
+}
+
+fn session_project_key(key: &ProjectGroupKey) -> String {
+    let paths = key
+        .path_list()
+        .paths()
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let host = key
+        .host()
+        .as_ref()
+        .map(|host| remote_connection_identity(host).persistence_key());
+    serde_json::json!({"host": host, "paths": paths}).to_string()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -432,7 +463,7 @@ impl RenameTarget {
                 Self::Terminal(terminal.metadata.terminal_id),
                 terminal.metadata.editable_title(),
             )),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::ProjectHeader { .. } | ListEntry::SessionGroupHeader { .. } => None,
         }
     }
 }
@@ -458,7 +489,7 @@ impl ActivatableEntry {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::ProjectHeader { .. } | ListEntry::SessionGroupHeader { .. } => None,
         }
     }
 }
@@ -468,7 +499,9 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
-            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Terminal(_)
+            | ListEntry::ProjectHeader { .. }
+            | ListEntry::SessionGroupHeader { .. } => None,
         }
     }
 
@@ -489,6 +522,7 @@ impl ListEntry {
             ListEntry::ProjectHeader { key, .. } => {
                 multi_workspace.workspaces_for_project_group(key, cx)
             }
+            ListEntry::SessionGroupHeader { .. } => Vec::new(),
         }
     }
 }
@@ -528,6 +562,7 @@ enum EntryShape {
         // `!is_collapsed && !has_threads`).
         is_collapsed: bool,
     },
+    SessionGroup(SessionGroupKey),
     Thread(ThreadId),
     Terminal(TerminalId),
 }
@@ -824,6 +859,8 @@ pub struct Sidebar {
     draft_kinds: HashMap<ThreadId, DraftKind>,
     /// Threads whose child threads are hidden.
     collapsed_thread_trees: HashSet<ThreadId>,
+    collapsed_session_groups: HashSet<SessionGroupKey>,
+    renaming_session_group: Option<SessionGroupKey>,
     view: SidebarView,
     restoring_tasks: HashMap<agent_ui::ThreadId, Task<()>>,
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
@@ -985,6 +1022,8 @@ impl Sidebar {
             live_thread_statuses: HashMap::new(),
             draft_kinds: HashMap::new(),
             collapsed_thread_trees: HashSet::new(),
+            collapsed_session_groups: HashSet::new(),
+            renaming_session_group: None,
             view: SidebarView::default(),
             restoring_tasks: HashMap::new(),
             recent_projects_popover_handle: PopoverMenuHandle::default(),
@@ -1408,6 +1447,480 @@ impl Sidebar {
             })
             .detach();
         }
+        if let Some(store) = SessionGroups::try_global(cx) {
+            cx.observe(&store, |this, _, cx| {
+                this.schedule_update_entries(false, cx)
+            })
+            .detach();
+        }
+    }
+
+    fn group_operation_error(&self, message: &'static str, cx: &mut App) {
+        if let Some(workspace) = self.active_workspace(cx) {
+            Self::show_thread_title_toast(workspace, message, cx);
+        }
+    }
+
+    fn save_session_group(&mut self, key: SessionGroupKey, name: String, cx: &mut Context<Self>) {
+        let Some(store) = SessionGroups::try_global(cx) else {
+            return;
+        };
+        let Some(list) = store.read(cx).list_for_service(&key.service_id) else {
+            self.group_operation_error("The session service is disconnected.", cx);
+            return;
+        };
+        let task = list.set_group(
+            &key.project_key,
+            acp_thread::SessionGroup {
+                group_id: key.group_id.clone(),
+                name,
+            },
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| match result {
+                Ok(group) => store.update(cx, |store, cx| {
+                    store.apply_group(&key.service_id, &key.project_key, group, cx);
+                    store.refresh(list, key.project_key.clone(), cx);
+                }),
+                Err(error) => {
+                    log::error!("Failed to rename session group: {error:#}");
+                    this.group_operation_error("Failed to rename session group.", cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn delete_session_group(&mut self, key: SessionGroupKey, cx: &mut Context<Self>) {
+        let Some(store) = SessionGroups::try_global(cx) else {
+            return;
+        };
+        let Some(list) = store.read(cx).list_for_service(&key.service_id) else {
+            self.group_operation_error("The session service is disconnected.", cx);
+            return;
+        };
+        let task = list.delete_group(&key.project_key, &key.group_id, cx);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| match result {
+                Ok(()) => store.update(cx, |store, cx| {
+                    store.refresh(list, key.project_key.clone(), cx);
+                }),
+                Err(error) => {
+                    log::error!("Failed to delete session group: {error:#}");
+                    this.group_operation_error("Failed to delete session group.", cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn move_session_to_group(
+        &mut self,
+        source: SessionSource,
+        session_id: acp::SessionId,
+        project_key: String,
+        group_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = SessionGroups::try_global(cx) else {
+            return;
+        };
+        let Some(list) = store.read(cx).list_for_source(&source) else {
+            self.group_operation_error("The session service is disconnected.", cx);
+            return;
+        };
+        let value = group_id
+            .map(|group_id| serde_json::json!({"projectKey": project_key, "groupId": group_id}))
+            .unwrap_or(serde_json::Value::Null);
+        let patch = serde_json::Map::from_iter([("gorynych/group".into(), value)]);
+        let task = list.patch_session_attributes(&session_id, patch, cx);
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = task.await {
+                log::error!("Failed to move session: {error:#}");
+                this.update(cx, |this, cx| {
+                    this.group_operation_error("Failed to move session.", cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn create_thread_in_session_group(
+        &mut self,
+        project: ProjectGroupKey,
+        key: SessionGroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(workspace) = self.workspace_for_group(&project, cx) {
+            self.create_group_thread_in_workspace(workspace, project, key, window, cx);
+            return;
+        }
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let active = multi_workspace.read(cx).workspace().clone();
+        let task = multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.find_or_create_workspace(
+                project.path_list().clone(),
+                project.host(),
+                Some(project.clone()),
+                |options, window, cx| connect_remote(active, options, window, cx),
+                None,
+                OpenMode::Activate,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let workspace = task.await?;
+            this.update_in(cx, |this, window, cx| {
+                this.create_group_thread_in_workspace(workspace, project, key, window, cx)
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn create_group_thread_in_workspace(
+        &mut self,
+        workspace: Entity<Workspace>,
+        project: ProjectGroupKey,
+        key: SessionGroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = SessionGroups::try_global(cx) else {
+            return;
+        };
+        let selected_source = workspace.read(cx).panel::<AgentPanel>(cx).map(|panel| {
+            SessionSource::new(
+                panel.read(cx).selected_agent(cx).id(),
+                project.host().as_ref(),
+            )
+        });
+        let source = selected_source
+            .filter(|source| {
+                store
+                    .read(cx)
+                    .list_for_source(source)
+                    .is_some_and(|list| list.service_id() == Some(key.service_id.as_str()))
+            })
+            .or_else(|| {
+                store
+                    .read(cx)
+                    .source_for_service(&key.service_id, project.host().as_ref())
+            });
+        let Some(source) = source else {
+            self.group_operation_error("The session service is disconnected.", cx);
+            return;
+        };
+        let attributes = serde_json::Map::from_iter([(
+            "gorynych/group".into(),
+            serde_json::json!({"projectKey": key.project_key, "groupId": key.group_id}),
+        )]);
+        if let Some(multi_workspace) = self.multi_workspace.upgrade() {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.activate(workspace.clone(), None, window, cx)
+            });
+        }
+        workspace.update(cx, |workspace, cx| {
+            let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                let thread_id = ThreadId::new();
+                store.update(cx, |store, _| {
+                    store.set_pending_draft(thread_id, key.service_id, attributes)
+                });
+                panel.create_thread_with_options(
+                    CreateThreadOptions {
+                        agent: Some(Agent::from(source.agent_id)),
+                        thread_id: Some(thread_id),
+                        ..Default::default()
+                    },
+                    AgentThreadSource::Sidebar,
+                    window,
+                    cx,
+                );
+                panel.activate_retained_thread(thread_id, true, window, cx);
+            });
+            workspace.focus_panel::<AgentPanel>(window, cx);
+        });
+    }
+
+    fn create_session_group(
+        &mut self,
+        project: ProjectGroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = SessionGroups::try_global(cx) else {
+            return;
+        };
+        let mut lists = store.read(cx).lists_for_host(project.host().as_ref());
+        lists.sort_by(|left, right| left.service_id().cmp(&right.service_id()));
+        let Some(list) = lists.into_iter().next() else {
+            return;
+        };
+        let Some(service_id) = list.service_id().map(str::to_owned) else {
+            return;
+        };
+        let key = SessionGroupKey {
+            service_id,
+            project_key: session_project_key(&project),
+            group_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let task = list.set_group(
+            &key.project_key,
+            acp_thread::SessionGroup {
+                group_id: key.group_id.clone(),
+                name: "Unnamed Group".into(),
+            },
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(group) => {
+                    store.update(cx, |store, cx| {
+                        store.apply_group(&key.service_id, &key.project_key, group, cx);
+                        store.refresh(list, key.project_key.clone(), cx);
+                    });
+                    this.set_group_expanded(&project, true, cx);
+                    this.update_entries(cx);
+                    if let Some(index) = this.contents.entries.iter().position(|entry| matches!(entry, ListEntry::SessionGroupHeader { key: current, .. } if current == &key)) {
+                        this.start_renaming_session_group(index, key, "Unnamed Group".into(), window, cx);
+                    }
+                }
+                Err(error) => { log::error!("Failed to create session group: {error:#}"); this.group_operation_error("Failed to create session group.", cx); }
+            }).ok();
+        }).detach();
+    }
+
+    fn start_renaming_session_group(
+        &mut self,
+        index: usize,
+        key: SessionGroupKey,
+        name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_entry_rename(window, cx);
+        self.selection = Some(index);
+        self.renaming_session_group = Some(key);
+        self.rename_editor.update(cx, |editor, cx| {
+            editor.set_text(name, window, cx);
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn session_group_layout(
+        project: &ProjectGroupKey,
+        project_key: &str,
+        threads: &[Arc<ThreadEntry>],
+        cx: &App,
+    ) -> (
+        Option<Vec<(SessionGroupKey, SharedString)>>,
+        HashMap<ThreadId, SessionGroupKey>,
+    ) {
+        let Some(store) = SessionGroups::try_global(cx) else {
+            return (None, HashMap::default());
+        };
+        let store = store.read(cx);
+        let lists = store.lists_for_host(project.host().as_ref());
+        if lists.is_empty() {
+            return (None, HashMap::default());
+        }
+        let mut groups = Vec::new();
+        for list in lists {
+            let Some(service_id) = list.service_id() else {
+                continue;
+            };
+            if let Some(catalog) = store.catalog(service_id, project_key) {
+                groups.extend(catalog.iter().map(|group| {
+                    (
+                        SessionGroupKey {
+                            service_id: service_id.to_owned(),
+                            project_key: project_key.to_owned(),
+                            group_id: group.group_id.clone(),
+                        },
+                        SharedString::from(group.name.clone()),
+                    )
+                }));
+            }
+        }
+        groups.sort_by(|left, right| {
+            left.1
+                .cmp(&right.1)
+                .then(left.0.service_id.cmp(&right.0.service_id))
+                .then(left.0.group_id.cmp(&right.0.group_id))
+        });
+        let Some(parent_store) = ThreadParentStore::try_global(cx) else {
+            return (Some(groups), HashMap::default());
+        };
+        let parent_store = parent_store.read(cx);
+        let nodes = threads
+            .iter()
+            .map(|thread| {
+                let source = SessionSource::of_thread(&thread.metadata);
+                let parent_session_id = thread
+                    .metadata
+                    .session_id
+                    .as_ref()
+                    .and_then(|session_id| parent_store.parent_session_id(&source, session_id))
+                    .cloned();
+                thread_tree::TreeNode {
+                    agent_id: Some(thread.metadata.agent_id.clone()),
+                    service_id: store
+                        .list_for_source(&source)
+                        .and_then(|list| list.service_id().map(str::to_owned)),
+                    session_id: thread.metadata.session_id.clone(),
+                    parent_session_id,
+                    sort_time: Self::thread_display_time(&thread.metadata),
+                    collapsed: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        let roots = thread_tree::root_indices(&nodes);
+        let mut memberships = HashMap::default();
+        for (index, root) in roots.into_iter().enumerate() {
+            if nodes[root].parent_session_id.is_some() {
+                continue;
+            }
+            let root_thread = &threads[root];
+            let source = SessionSource::of_thread(&root_thread.metadata);
+            let membership = if let Some(session_id) = root_thread.metadata.session_id.as_ref() {
+                store.list_for_source(&source).and_then(|list| {
+                    Some((
+                        list.service_id()?.to_owned(),
+                        store.attributes(&source, session_id)?.clone(),
+                    ))
+                })
+            } else {
+                store.pending_draft(root_thread.metadata.thread_id)
+            };
+            let Some((service_id, attributes)) = membership else {
+                continue;
+            };
+            let Some(group) = attributes
+                .get("gorynych/group")
+                .and_then(|value| value.as_object())
+            else {
+                continue;
+            };
+            if group.get("projectKey").and_then(|value| value.as_str()) != Some(project_key) {
+                continue;
+            }
+            let Some(group_id) = group.get("groupId").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let key = SessionGroupKey {
+                service_id,
+                project_key: project_key.to_owned(),
+                group_id: group_id.to_owned(),
+            };
+            if groups.iter().any(|(known, _)| known == &key) {
+                memberships.insert(threads[index].metadata.thread_id, key);
+            }
+        }
+        (Some(groups), memberships)
+    }
+
+    fn partition_session_groups(
+        &self,
+        entries: &mut Vec<ListEntry>,
+        start: usize,
+        project_key: &str,
+        groups: &Option<Vec<(SessionGroupKey, SharedString)>>,
+        memberships: &HashMap<ThreadId, SessionGroupKey>,
+        all_threads: &[Arc<ThreadEntry>],
+        notified_threads: &HashSet<ThreadId>,
+        searching: bool,
+    ) {
+        let Some(groups) = groups else {
+            return;
+        };
+        let mut grouped: HashMap<SessionGroupKey, Vec<ListEntry>> = HashMap::default();
+        let mut ungrouped = Vec::new();
+        for entry in entries.split_off(start) {
+            let key = match &entry {
+                ListEntry::Thread(thread) => memberships.get(&thread.metadata.thread_id),
+                _ => None,
+            };
+            if let Some(key) = key {
+                grouped.entry(key.clone()).or_default().push(entry);
+            } else {
+                ungrouped.push(entry);
+            }
+        }
+        for (key, name) in groups {
+            let rows = grouped.remove(key).unwrap_or_default();
+            if searching && rows.is_empty() {
+                continue;
+            }
+            let group_threads = || {
+                all_threads
+                    .iter()
+                    .filter(|thread| memberships.get(&thread.metadata.thread_id) == Some(key))
+            };
+            let has_running =
+                group_threads().any(|thread| thread.status == AgentThreadStatus::Running);
+            let has_waiting = group_threads()
+                .any(|thread| thread.status == AgentThreadStatus::WaitingForConfirmation);
+            let has_notifications =
+                group_threads().any(|thread| notified_threads.contains(&thread.metadata.thread_id));
+            entries.push(ListEntry::SessionGroupHeader {
+                key: key.clone(),
+                name: name.clone(),
+                has_running,
+                has_waiting,
+                has_notifications,
+            });
+            if searching || !self.collapsed_session_groups.contains(key) {
+                entries.extend(rows);
+            }
+        }
+        if !searching || !ungrouped.is_empty() {
+            let group_threads = || {
+                all_threads
+                    .iter()
+                    .filter(|thread| !memberships.contains_key(&thread.metadata.thread_id))
+            };
+            let has_running =
+                group_threads().any(|thread| thread.status == AgentThreadStatus::Running);
+            let has_waiting = group_threads()
+                .any(|thread| thread.status == AgentThreadStatus::WaitingForConfirmation);
+            let has_notifications = group_threads()
+                .any(|thread| notified_threads.contains(&thread.metadata.thread_id))
+                || ungrouped.iter().any(
+                    |row| matches!(row, ListEntry::Terminal(terminal) if terminal.has_notification),
+                );
+            let key = SessionGroupKey {
+                service_id: String::new(),
+                project_key: project_key.to_owned(),
+                group_id: String::new(),
+            };
+            entries.push(ListEntry::SessionGroupHeader {
+                key: key.clone(),
+                name: "Ungrouped".into(),
+                has_running,
+                has_waiting,
+                has_notifications,
+            });
+            if searching || !self.collapsed_session_groups.contains(&key) {
+                entries.extend(ungrouped);
+            }
+        }
     }
 
     /// Rebuilds the sidebar contents from current workspace and thread state.
@@ -1526,6 +2039,7 @@ impl Sidebar {
         for group in &groups {
             let group_key = &group.key;
             let group_workspaces = &group.workspaces;
+            let session_project_key = session_project_key(group_key);
 
             let workspace_by_path_list: HashMap<PathList, &Entity<Workspace>> = group_workspaces
                 .iter()
@@ -1974,6 +2488,9 @@ impl Sidebar {
             };
             let has_threads = has_visible_rows || has_stored_thread_rows;
 
+            let (session_groups, memberships) =
+                Self::session_group_layout(group_key, &session_project_key, &threads, cx);
+            let group_status_threads = threads.clone();
             if !query.is_empty() {
                 let workspace_highlight_positions =
                     fuzzy_match_positions(&query, &label).unwrap_or_default();
@@ -2071,6 +2588,16 @@ impl Sidebar {
                     &mut thread_tree,
                     cx,
                 );
+                self.partition_session_groups(
+                    &mut entries,
+                    group_start,
+                    &session_project_key,
+                    &session_groups,
+                    &memberships,
+                    &group_status_threads,
+                    &notified_threads,
+                    true,
+                );
             } else {
                 let has_terminal_notifications = terminals
                     .iter()
@@ -2129,6 +2656,16 @@ impl Sidebar {
                     &mut thread_tree,
                     cx,
                 );
+                self.partition_session_groups(
+                    &mut entries,
+                    group_start,
+                    &session_project_key,
+                    &session_groups,
+                    &memberships,
+                    &group_status_threads,
+                    &notified_threads,
+                    false,
+                );
             }
         }
 
@@ -2176,6 +2713,20 @@ impl Sidebar {
         };
         if !multi_workspace.read(cx).multi_workspace_enabled(cx) {
             return;
+        }
+
+        let project_keys = multi_workspace
+            .read(cx)
+            .project_groups(cx)
+            .into_iter()
+            .map(|group| group.key)
+            .collect::<Vec<_>>();
+        if let Some(store) = SessionGroups::try_global(cx) {
+            store.update(cx, |store, cx| {
+                for key in project_keys {
+                    store.ensure_project(key.host().as_ref(), &session_project_key(&key), cx);
+                }
+            });
         }
 
         let had_notifications = self.has_notifications(cx);
@@ -2247,6 +2798,7 @@ impl Sidebar {
             },
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
+            ListEntry::SessionGroupHeader { key, .. } => EntryShape::SessionGroup(key.clone()),
         })
     }
 
@@ -2398,6 +2950,161 @@ impl Sidebar {
                 let row = self.render_thread(ix, thread, is_active, is_selected, cx);
                 let row = self.render_open_elsewhere_tooltip(ix, &thread.metadata, row, cx);
                 self.render_thread_tree_row(thread.metadata.thread_id, row)
+            }
+            ListEntry::SessionGroupHeader {
+                key,
+                name,
+                has_running,
+                has_waiting,
+                has_notifications,
+            } => {
+                let key = key.clone();
+                let name = name.clone();
+                let collapsed = self.collapsed_session_groups.contains(&key);
+                let group_label = if self.renaming_session_group.as_ref() == Some(&key) {
+                    self.render_rename_title_editor(cx)
+                } else {
+                    Label::new(name.clone()).truncate().into_any_element()
+                };
+                let menu_key = key.clone();
+                let sidebar = cx.weak_entity();
+                let project =
+                    self.contents.entries[..ix]
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            ListEntry::ProjectHeader { key, .. } => Some(key.clone()),
+                            _ => None,
+                        });
+                let new_thread_key = key.clone();
+                let new_thread_button = (!key.group_id.is_empty()).then(|| {
+                    IconButton::new(
+                        SharedString::from(format!("session-group-new-thread-{ix}")),
+                        IconName::Plus,
+                    )
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Start New Thread in Group"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        if let Some(project) = project.clone() {
+                            this.create_thread_in_session_group(
+                                project,
+                                new_thread_key.clone(),
+                                window,
+                                cx,
+                            );
+                        }
+                    }))
+                });
+                let menu = (!key.group_id.is_empty()).then(|| {
+                    PopoverMenu::new(SharedString::from(format!("session-group-menu-{ix}")))
+                        .trigger(
+                            IconButton::new(
+                                SharedString::from(format!("session-group-actions-{ix}")),
+                                IconName::Ellipsis,
+                            )
+                            .icon_size(IconSize::Small),
+                        )
+                        .menu(move |window, cx| {
+                            let rename_key = menu_key.clone();
+                            let delete_key = menu_key.clone();
+                            let sidebar_rename = sidebar.clone();
+                            let sidebar_delete = sidebar.clone();
+                            let name = name.clone();
+                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                menu.entry("Rename Group", None, move |window, cx| {
+                                    sidebar_rename
+                                        .update(cx, |sidebar, cx| {
+                                            sidebar.start_renaming_session_group(
+                                                ix,
+                                                rename_key.clone(),
+                                                name.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        })
+                                        .ok();
+                                })
+                                .entry(
+                                    "Delete Group",
+                                    None,
+                                    move |_, cx| {
+                                        sidebar_delete
+                                            .update(cx, |sidebar, cx| {
+                                                sidebar.delete_session_group(delete_key.clone(), cx)
+                                            })
+                                            .ok();
+                                    },
+                                )
+                            }))
+                        })
+                });
+                h_flex()
+                    .id(SharedString::from(format!("session-group-{ix}")))
+                    .pl_4()
+                    .h(Tab::content_height(cx))
+                    .w_full()
+                    .border_1()
+                    .border_color(if is_selected {
+                        cx.theme().colors().panel_focused_border
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .gap_1()
+                    .cursor_pointer()
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::Small),
+                    )
+                    .child(div().min_w_0().flex_1().child(group_label))
+                    .when(collapsed && *has_running, |row| {
+                        row.child(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::XSmall)
+                                .with_rotate_animation(2),
+                        )
+                    })
+                    .when(collapsed && *has_waiting, |row| {
+                        row.child(
+                            Icon::new(IconName::Warning)
+                                .size(IconSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                    })
+                    .when(
+                        collapsed && *has_notifications && !*has_running && !*has_waiting,
+                        |row| {
+                            row.child(
+                                Icon::new(IconName::Circle)
+                                    .size(IconSize::Small)
+                                    .color(Color::Accent),
+                            )
+                        },
+                    )
+                    .child(
+                        h_flex()
+                            .children(new_thread_button)
+                            .children(menu)
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation()
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.renaming_session_group.as_ref() == Some(&key) {
+                            return;
+                        }
+                        this.selection = Some(ix);
+                        this.focus_handle.focus(window, cx);
+                        if !this.collapsed_session_groups.remove(&key) {
+                            this.collapsed_session_groups.insert(key.clone());
+                        }
+                        this.schedule_update_entries(false, cx);
+                    }))
+                    .into_any_element()
             }
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
@@ -3063,11 +3770,28 @@ impl Sidebar {
                     .iter()
                     .map(|workspace| active_workspace.as_ref() == Some(workspace))
                     .collect();
+                let can_create_session_group = SessionGroups::try_global(cx).is_some_and(|store| {
+                    !store
+                        .read(cx)
+                        .lists_for_host(project_group_key.host().as_ref())
+                        .is_empty()
+                });
 
                 let menu =
                     ContextMenu::build_persistent(window, cx, move |menu, _window, menu_cx| {
                         let menu = menu.end_slot_action(Box::new(menu::SecondaryConfirm));
                         let weak_menu = menu_cx.weak_entity();
+
+                        let menu = menu.when(can_create_session_group, |menu| {
+                            let this = this_for_menu.clone();
+                            let project = project_group_key.clone();
+                            menu.entry("Create Group", None, move |window, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.create_session_group(project.clone(), window, cx)
+                                })
+                                .ok();
+                            })
+                        });
 
                         let menu = menu.when(show_multi_project_entries, |this| {
                             this.entry(
@@ -3557,6 +4281,9 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.renaming_session_group.is_some() {
+            self.finish_entry_rename(window, cx);
+        }
         if self.rename_target == Some(target) {
             self.rename_editor.update(cx, |editor, cx| {
                 editor.select_all(&editor::actions::SelectAll, window, cx);
@@ -3589,6 +4316,9 @@ impl Sidebar {
     ) {
         match event {
             editor::EditorEvent::BufferEdited => {
+                if self.renaming_session_group.is_some() {
+                    return;
+                }
                 if self.suppress_next_rename_edit {
                     self.suppress_next_rename_edit = false;
                     return;
@@ -3681,6 +4411,15 @@ impl Sidebar {
     }
 
     fn finish_entry_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(key) = self.renaming_session_group.take() {
+            let name = self.rename_editor.read(cx).text(cx).trim().to_owned();
+            if !name.is_empty() {
+                self.save_session_group(key, name, cx);
+            }
+            self.focus_handle.focus(window, cx);
+            self.update_entries(cx);
+            return true;
+        }
         if self.rename_target.take().is_none() {
             return false;
         }
@@ -3776,6 +4515,13 @@ impl Sidebar {
             ListEntry::ProjectHeader { key, .. } => {
                 let key = key.clone();
                 self.toggle_collapse(&key, window, cx);
+            }
+            ListEntry::SessionGroupHeader { key, .. } => {
+                let key = key.clone();
+                if !self.collapsed_session_groups.remove(&key) {
+                    self.collapsed_session_groups.insert(key);
+                }
+                self.schedule_update_entries(false, cx);
             }
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();
@@ -4507,6 +5253,21 @@ impl Sidebar {
         }
 
         match self.contents.entries.get(ix) {
+            Some(ListEntry::SessionGroupHeader { key, .. }) => {
+                let key = key.clone();
+                if self.collapsed_session_groups.remove(&key) {
+                    self.update_entries(cx);
+                } else if ix + 1 < self.contents.entries.len()
+                    && matches!(
+                        self.contents.entries.get(ix + 1),
+                        Some(ListEntry::Thread(_) | ListEntry::Terminal(_))
+                    )
+                {
+                    self.selection = Some(ix + 1);
+                    self.list_state.scroll_to_reveal_item(ix + 1);
+                    cx.notify();
+                }
+            }
             Some(ListEntry::ProjectHeader { key, .. }) => {
                 let key = key.clone();
                 if self.is_group_collapsed(&key, cx) {
@@ -4534,6 +5295,11 @@ impl Sidebar {
         }
 
         match self.contents.entries.get(ix) {
+            Some(ListEntry::SessionGroupHeader { key, .. }) => {
+                let key = key.clone();
+                self.collapsed_session_groups.insert(key);
+                self.update_entries(cx);
+            }
             Some(ListEntry::ProjectHeader { key, .. }) => {
                 let key = key.clone();
                 if !self.is_group_collapsed(&key, cx) {
@@ -4543,6 +5309,15 @@ impl Sidebar {
             }
             Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
                 for i in (0..ix).rev() {
+                    if let Some(ListEntry::SessionGroupHeader { key, .. }) =
+                        self.contents.entries.get(i)
+                    {
+                        let key = key.clone();
+                        self.selection = Some(i);
+                        self.collapsed_session_groups.insert(key);
+                        self.update_entries(cx);
+                        break;
+                    }
                     if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
                     {
                         let key = key.clone();
@@ -4568,16 +5343,35 @@ impl Sidebar {
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
+            Some(ListEntry::SessionGroupHeader { key, .. }) => {
+                let key = key.clone();
+                if !self.collapsed_session_groups.remove(&key) {
+                    self.collapsed_session_groups.insert(key);
+                }
+                self.update_entries(cx);
+                return;
+            }
             Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => (0..ix).rev().find(|&i| {
                 matches!(
                     self.contents.entries.get(i),
-                    Some(ListEntry::ProjectHeader { .. })
+                    Some(ListEntry::ProjectHeader { .. } | ListEntry::SessionGroupHeader { .. })
                 )
             }),
             None => None,
         };
 
         if let Some(header_ix) = header_ix {
+            if let Some(ListEntry::SessionGroupHeader { key, .. }) =
+                self.contents.entries.get(header_ix)
+            {
+                let key = key.clone();
+                self.selection = Some(header_ix);
+                if !self.collapsed_session_groups.remove(&key) {
+                    self.collapsed_session_groups.insert(key);
+                }
+                self.update_entries(cx);
+                return;
+            }
             if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(header_ix)
             {
                 let key = key.clone();
@@ -6008,7 +6802,9 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+                ListEntry::ProjectHeader { .. } | ListEntry::SessionGroupHeader { .. } => {
+                    unreachable!()
+                }
             }
         }
 
@@ -6066,6 +6862,7 @@ impl Sidebar {
                     current_header_key = Some(key.clone());
                     None
                 }
+                ListEntry::SessionGroupHeader { .. } => None,
                 ListEntry::Thread(thread) => {
                     if thread.draft == Some(DraftKind::Empty) {
                         return None;
@@ -6713,6 +7510,38 @@ impl Sidebar {
         let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
         let can_open_as_markdown = thread.is_live || is_zed_thread;
         let folder_paths = thread.metadata.folder_paths().clone();
+        let source = SessionSource::of_thread(&thread.metadata);
+        let move_choices = (|| {
+            let parent_store = ThreadParentStore::try_global(cx)?;
+            if parent_store
+                .read(cx)
+                .parent_session_id(&source, &session_id)
+                .is_some()
+            {
+                return None;
+            }
+            let project =
+                self.contents.entries[..ix]
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        ListEntry::ProjectHeader { key, .. } => Some(key),
+                        _ => None,
+                    })?;
+            let project_key = session_project_key(project);
+            let store = SessionGroups::try_global(cx)?;
+            let store = store.read(cx);
+            let list = store.list_for_source(&source)?;
+            let service_id = list.service_id()?;
+            let catalog = store.catalog(service_id, &project_key)?;
+            Some((
+                project_key,
+                catalog
+                    .iter()
+                    .map(|group| (group.group_id.clone(), group.name.clone()))
+                    .collect::<Vec<_>>(),
+            ))
+        })();
 
         right_click_menu(context_menu_id)
             .trigger(move |_, _, _| thread_item)
@@ -6728,6 +7557,8 @@ impl Sidebar {
                     let markdown_title = markdown_title.clone();
                     let rename_title = rename_title.clone();
                     let folder_paths = folder_paths.clone();
+                    let move_choices = move_choices.clone();
+                    let source = source.clone();
                     ContextMenu::build(_window, cx, move |mut menu, _window, _cx| {
                         menu = menu.entry("Rename Title", None, {
                             let sidebar = sidebar.clone();
@@ -6746,6 +7577,39 @@ impl Sidebar {
                                     .ok();
                             }
                         });
+
+                        if let Some((project_key, groups)) = move_choices {
+                            let sidebar = sidebar.clone();
+                            let session_id = session_id.clone();
+                            menu = menu.submenu("Move to Group", move |mut submenu, _, _| {
+                                for (group_id, name) in
+                                    std::iter::once((None, "Ungrouped".to_string())).chain(
+                                        groups
+                                            .iter()
+                                            .map(|(id, name)| (Some(id.clone()), name.clone())),
+                                    )
+                                {
+                                    let sidebar = sidebar.clone();
+                                    let source = source.clone();
+                                    let session_id = session_id.clone();
+                                    let project_key = project_key.clone();
+                                    submenu = submenu.entry(name, None, move |_, cx| {
+                                        sidebar
+                                            .update(cx, |sidebar, cx| {
+                                                sidebar.move_session_to_group(
+                                                    source.clone(),
+                                                    session_id.clone(),
+                                                    project_key.clone(),
+                                                    group_id.clone(),
+                                                    cx,
+                                                )
+                                            })
+                                            .ok();
+                                    });
+                                }
+                                submenu
+                            });
+                        }
 
                         if is_zed_thread {
                             menu = menu.entry("Regenerate Thread Title", None, {
@@ -7528,7 +8392,7 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, true, window, cx);
             }
-            ListEntry::ProjectHeader { .. } => {}
+            ListEntry::ProjectHeader { .. } | ListEntry::SessionGroupHeader { .. } => {}
         }
     }
 

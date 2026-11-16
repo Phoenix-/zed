@@ -71,6 +71,12 @@ The Threads Sidebar can hold multiple projects at once. Each project gets its ow
 
 To add another project to the sidebar, click the **Add Project** button (open-folder icon) in the sidebar bottom bar. The popover that opens lists your recent projects and also provides **Add Local Folders** and **Add Remote Folder** buttons at the bottom.
 
+### Session Groups {#session-groups}
+
+When a Gorynych service advertises session groups, use **Create Group** in a project header's menu to add one. Groups appear inside the project alongside an **Ungrouped** section. Use a group's `+` button to start a thread there, or its menu to rename or delete it. Deleting a group leaves its threads in place. Right-click a root thread and choose **Move to Group** to move the whole thread tree, including its children.
+
+Gorynych stores the groups and memberships, so existing conversations and empty groups return after Zed's local metadata is removed. Empty drafts before their first prompt follow the existing draft lifecycle.
+
 ### Multi-Root Folder Projects {#multi-root-folder-projects}
 
 A single project can contain multiple folders (a multi-root folder project). Agents can then read and write across all of those folders in a single thread. There are multiple ways to set one up:

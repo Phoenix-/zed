@@ -28,6 +28,7 @@ pub mod open_elsewhere_store;
 mod profile_selector;
 pub mod session_activity_store;
 pub mod session_auto_import;
+pub mod session_groups;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;
@@ -81,7 +82,8 @@ use workspace::Workspace;
 use crate::agent_configuration::ManageProfilesModal;
 pub use crate::agent_connection_store::{ActiveAcpConnection, AgentConnectionStore};
 pub use crate::agent_panel::{
-    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, TerminalId, ThreadTitleRegenerationResult,
+    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, CreateThreadOptions, TerminalId,
+    ThreadTitleRegenerationResult,
 };
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
@@ -720,6 +722,7 @@ pub fn init(
     open_elsewhere_store::init(cx);
     session_auto_import::init(cx);
     session_activity_store::init(cx);
+    session_groups::init(cx);
     terminal_thread_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);

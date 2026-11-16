@@ -213,6 +213,7 @@ fn assert_remote_project_integration_sidebar_state(
                     "expected the only sidebar project header to be `project`"
                 );
             }
+            ListEntry::SessionGroupHeader { .. } => panic!("unexpected session group"),
             ListEntry::Thread(thread)
                 if thread.metadata.session_id.as_ref() == Some(main_thread_id) =>
             {
@@ -693,6 +694,10 @@ fn visible_entries_as_strings(
                             "v"
                         };
                         format!("{} [{}]{}", icon, label, selected)
+                    }
+                    ListEntry::SessionGroupHeader { key, name, .. } => {
+                        let icon = if sidebar.collapsed_session_groups.contains(key) { ">" } else { "v" };
+                        format!("  {icon} [{name}]{selected}")
                     }
                     ListEntry::Thread(thread) => {
                         let title = thread.metadata.display_title();
@@ -5914,7 +5919,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
                     thread.metadata.thread_id,
                     thread.metadata.display_title(),
                 )),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::SessionGroupHeader { .. }
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -6000,7 +6007,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
             .iter()
             .find_map(|entry| match entry {
                 ListEntry::Thread(thread) => Some(thread),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::SessionGroupHeader { .. }
+                | ListEntry::Terminal(_) => None,
             })
             .expect("renamed thread should match the search");
         let title = thread.metadata.display_title();
@@ -6039,7 +6048,9 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
             .enumerate()
             .find_map(|(ix, entry)| match entry {
                 ListEntry::Thread(thread) => Some((ix, thread.metadata.thread_id)),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::SessionGroupHeader { .. }
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -8107,6 +8118,7 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
         let mut saw_expected_thread = false;
         for entry in &sidebar.contents.entries {
             match entry {
+                ListEntry::SessionGroupHeader { .. } => panic!("unexpected session group"),
                 ListEntry::ProjectHeader { label, .. } => {
                     assert_eq!(
                         label.as_ref(),
@@ -17011,4 +17023,251 @@ async fn test_collapsed_project_counts_imported_session_activity(cx: &mut TestAp
         waiting_count, 1,
         "collapsed group must count imported requires_action"
     );
+}
+
+#[derive(Default)]
+struct SessionGroupTestList {
+    groups: std::cell::RefCell<Vec<acp_thread::SessionGroup>>,
+}
+
+impl acp_thread::AgentSessionList for SessionGroupTestList {
+    fn list_sessions(
+        &self,
+        _: acp_thread::AgentSessionListRequest,
+        _: &mut App,
+    ) -> Task<anyhow::Result<acp_thread::AgentSessionListResponse>> {
+        Task::ready(Ok(acp_thread::AgentSessionListResponse::new(Vec::new())))
+    }
+    fn supports_session_attributes(&self) -> bool {
+        true
+    }
+    fn supports_groups(&self) -> bool {
+        true
+    }
+    fn service_id(&self) -> Option<&str> {
+        Some("test-service")
+    }
+    fn list_groups(
+        &self,
+        _: &str,
+        _: &mut App,
+    ) -> Task<anyhow::Result<Vec<acp_thread::SessionGroup>>> {
+        Task::ready(Ok(self.groups.borrow().clone()))
+    }
+    fn set_group(
+        &self,
+        _: &str,
+        group: acp_thread::SessionGroup,
+        _: &mut App,
+    ) -> Task<anyhow::Result<acp_thread::SessionGroup>> {
+        self.groups.borrow_mut().push(group.clone());
+        Task::ready(Ok(group))
+    }
+    fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {
+        self
+    }
+}
+
+#[gpui::test]
+async fn test_create_empty_group_and_layout_loading_draft(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    cx.update(|cx| {
+        agent_ui::thread_parent_store::ThreadParentStore::init_global(cx);
+        agent_ui::session_groups::init(cx);
+    });
+    let list = Rc::new(SessionGroupTestList::default());
+    let dyn_list: Rc<dyn acp_thread::AgentSessionList> = list.clone();
+    let source = SessionSource::local(agent::ZED_AGENT_ID.clone());
+    cx.update(|cx| {
+        SessionGroups::try_global(cx)
+            .expect("groups")
+            .update(cx, |store, cx| store.register(source, &dyn_list, cx));
+    });
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let project_key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.create_session_group(project_key.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    let created = list
+        .groups
+        .borrow()
+        .first()
+        .cloned()
+        .expect("group request");
+    assert_eq!(created.name, "Unnamed Group");
+    let key = sidebar.read_with(cx, |sidebar, _| {
+        let (key, _) = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::SessionGroupHeader { key, name, .. }
+                    if key.group_id == created.group_id =>
+                {
+                    Some((key.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .expect("empty group is shown");
+        assert_eq!(sidebar.renaming_session_group.as_ref(), Some(&key));
+        key
+    });
+    save_minute_thread("draft-session", "Draft", 1, &project, cx);
+    cx.run_until_parked();
+    let draft = sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread)
+                    if thread.metadata.session_id.as_ref()
+                        == Some(&acp::SessionId::new("draft-session")) =>
+                {
+                    Some(thread.clone())
+                }
+                _ => None,
+            })
+            .expect("draft fixture")
+    });
+    let mut draft = (*draft).clone();
+    draft.metadata.session_id = None;
+    let thread_id = draft.metadata.thread_id;
+    cx.update(|_, cx| {
+        let store = SessionGroups::try_global(cx).expect("groups");
+        store.update(cx, |store, _| {
+            store.set_pending_draft(
+                thread_id,
+                key.service_id.clone(),
+                serde_json::Map::from_iter([(
+                    "gorynych/group".into(),
+                    serde_json::json!({"projectKey":key.project_key, "groupId":key.group_id}),
+                )]),
+            )
+        });
+        let (_, memberships) = Sidebar::session_group_layout(
+            &project_key,
+            &session_project_key(&project_key),
+            &[Arc::new(draft)],
+            cx,
+        );
+        assert_eq!(memberships.get(&thread_id), Some(&key));
+    });
+}
+
+#[derive(Clone)]
+struct GroupDraftTestConnection {
+    inner: StubAgentConnection,
+    initial_attributes: Arc<std::sync::Mutex<Vec<acp_thread::SessionAttributes>>>,
+}
+
+impl acp_thread::AgentConnection for GroupDraftTestConnection {
+    fn agent_id(&self) -> AgentId {
+        AgentId::new("group-agent")
+    }
+    fn telemetry_id(&self) -> SharedString {
+        "group-agent".into()
+    }
+    fn auth_methods(&self) -> &[acp_v2::AuthMethod] {
+        &[]
+    }
+    fn authenticate(&self, _: acp_v2::AuthMethodId, _: &mut App) -> Task<anyhow::Result<()>> {
+        Task::ready(Ok(()))
+    }
+    fn cancel(&self, _: &acp_v2::SessionId, _: &mut App) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn new_session(
+        self: Rc<Self>,
+        project: Entity<project::Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<AcpThread>>> {
+        Rc::new(self.inner.clone()).new_session(project, work_dirs, cx)
+    }
+    fn new_session_with_attributes(
+        self: Rc<Self>,
+        project: Entity<project::Project>,
+        work_dirs: PathList,
+        attributes: acp_thread::SessionAttributes,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<AcpThread>>> {
+        self.initial_attributes
+            .lock()
+            .expect("attributes lock")
+            .push(attributes);
+        Rc::new(self.inner.clone()).new_session(project, work_dirs, cx)
+    }
+    fn session_list(&self, _: &mut App) -> Option<Rc<dyn acp_thread::AgentSessionList>> {
+        Some(Rc::new(SessionGroupTestList::default()))
+    }
+    fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {
+        self
+    }
+}
+
+#[gpui::test]
+async fn test_group_plus_creates_root_with_initial_attributes_and_shows_empty_draft(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    cx.update(|cx| {
+        agent_ui::thread_parent_store::ThreadParentStore::init_global(cx);
+        agent_ui::session_groups::init(cx);
+    });
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let initial_attributes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let connection = GroupDraftTestConnection {
+        inner: StubAgentConnection::new().with_agent_id(AgentId::new("group-agent")),
+        initial_attributes: initial_attributes.clone(),
+    };
+    open_thread_with_custom_connection(&panel, connection, cx);
+    let list: Rc<dyn acp_thread::AgentSessionList> = Rc::new(SessionGroupTestList::default());
+    let project_key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+    let key = SessionGroupKey {
+        service_id: "test-service".into(),
+        project_key: session_project_key(&project_key),
+        group_id: "target".into(),
+    };
+    cx.update(|_, cx| {
+        SessionGroups::try_global(cx)
+            .expect("groups")
+            .update(cx, |store, cx| {
+                store.register(SessionSource::local(AgentId::new("group-agent")), &list, cx);
+                store.apply_group(
+                    &key.service_id,
+                    &key.project_key,
+                    acp_thread::SessionGroup {
+                        group_id: key.group_id.clone(),
+                        name: "Target".into(),
+                    },
+                    cx,
+                );
+            });
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.create_thread_in_session_group(project_key.clone(), key.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    let calls = initial_attributes.lock().expect("attributes lock");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].get("gorynych/group"),
+        Some(&serde_json::json!({"projectKey":key.project_key,"groupId":key.group_id}))
+    );
+    drop(calls);
+    let thread_id = panel.read_with(cx, |panel, cx| {
+        panel.active_thread_id(cx).expect("active draft")
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    sidebar.read_with(cx, |sidebar, _| {
+        let group_index = sidebar.contents.entries.iter().position(|entry| matches!(entry, ListEntry::SessionGroupHeader { key: current, .. } if current == &key)).expect("group header");
+        let draft_index = sidebar.contents.entries.iter().position(|entry| matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == thread_id)).expect("empty draft row");
+        assert_eq!(draft_index, group_index + 1);
+    });
 }

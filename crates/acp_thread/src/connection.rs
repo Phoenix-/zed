@@ -113,6 +113,18 @@ pub trait AgentConnection {
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>>;
 
+    fn new_session_with_attributes(
+        self: Rc<Self>,
+        _project: Entity<Project>,
+        _work_dirs: PathList,
+        _attributes: SessionAttributes,
+        _cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "initial session attributes not supported"
+        )))
+    }
+
     /// Whether this agent supports loading existing sessions.
     fn supports_load_session(&self) -> bool {
         false
@@ -575,6 +587,9 @@ impl From<acp_v2::SessionInfoUpdate> for AgentSessionInfoUpdate {
 #[derive(Debug, Clone)]
 pub enum SessionListUpdate {
     Refresh,
+    GroupsChanged {
+        project_key: String,
+    },
     SessionInfo {
         session_id: acp_v2::SessionId,
         update: AgentSessionInfoUpdate,
@@ -592,7 +607,55 @@ pub enum SessionListUpdate {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionGroup {
+    pub group_id: String,
+    pub name: String,
+}
+
+pub type SessionAttributes = serde_json::Map<String, serde_json::Value>;
+
 pub trait AgentSessionList {
+    fn service_id(&self) -> Option<&str> {
+        None
+    }
+    fn supports_session_attributes(&self) -> bool {
+        false
+    }
+    fn supports_groups(&self) -> bool {
+        false
+    }
+
+    fn get_session_attributes(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _cx: &mut App,
+    ) -> Task<Result<SessionAttributes>> {
+        Task::ready(Err(anyhow::anyhow!("session attributes not supported")))
+    }
+    fn patch_session_attributes(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _patch: SessionAttributes,
+        _cx: &mut App,
+    ) -> Task<Result<SessionAttributes>> {
+        Task::ready(Err(anyhow::anyhow!("session attributes not supported")))
+    }
+    fn list_groups(&self, _project_key: &str, _cx: &mut App) -> Task<Result<Vec<SessionGroup>>> {
+        Task::ready(Err(anyhow::anyhow!("session groups not supported")))
+    }
+    fn set_group(
+        &self,
+        _project_key: &str,
+        _group: SessionGroup,
+        _cx: &mut App,
+    ) -> Task<Result<SessionGroup>> {
+        Task::ready(Err(anyhow::anyhow!("session groups not supported")))
+    }
+    fn delete_group(&self, _project_key: &str, _group_id: &str, _cx: &mut App) -> Task<Result<()>> {
+        Task::ready(Err(anyhow::anyhow!("session groups not supported")))
+    }
     fn list_sessions(
         &self,
         request: AgentSessionListRequest,

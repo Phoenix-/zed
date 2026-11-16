@@ -8,7 +8,7 @@
 //! flag for its sessions, which clients set with `_gorynych/archive`.
 
 use agent_client_protocol::{
-    JsonRpcNotification, JsonRpcRequest, schema::v1 as acp, schema::v2 as acp_v2,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, schema::v1 as acp, schema::v2 as acp_v2,
 };
 use anyhow::{Result, anyhow};
 use gpui::{App, AsyncApp, Task};
@@ -194,6 +194,127 @@ mod tests {
         let withdrawn = capabilities(&[(ARCHIVE_META_KEY, false.into())]);
         let old_place = meta(&[(ARCHIVE_META_KEY, true.into())]);
         assert!(!advertises_archive(&withdrawn, Some(&old_place)));
+        assert!(!advertises_extension(&none, "gorynych/groups"));
+        assert!(advertises_extension(
+            &capabilities(&[("gorynych/groups", true.into())]),
+            "gorynych/groups"
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_group_requests_are_capability_gated_and_round_trip(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let _agent_task = cx.background_spawn(
+            Agent
+                .builder()
+                .name("groups-agent")
+                .on_receive_request(
+                    async move |request: GetAttributesRequest, responder, _cx| {
+                        responder.respond(AttributesResponse {
+                            attributes: serde_json::Map::from_iter([(
+                                "session".into(),
+                                request.session_id.into(),
+                            )]),
+                        })
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: PatchAttributesRequest, responder, _cx| {
+                        responder.respond(AttributesResponse {
+                            attributes: request.patch,
+                        })
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: ListGroupsRequest, responder, _cx| {
+                        responder.respond(ListGroupsResponse {
+                            groups: vec![acp_thread::SessionGroup {
+                                group_id: request.project_key,
+                                name: "Group".into(),
+                            }],
+                        })
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: SetGroupRequest, responder, _cx| {
+                        responder.respond(SetGroupResponse {
+                            group: acp_thread::SessionGroup {
+                                group_id: request.group_id,
+                                name: request.name,
+                            },
+                        })
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_request: DeleteGroupRequest, responder, _cx| {
+                        responder.respond(serde_json::json!({}))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_transport),
+        );
+        let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
+        let _client_task =
+            cx.background_spawn(Client.builder().name("groups-client").connect_with(
+                client_transport,
+                move |connection: ConnectionTo<Agent>| async move {
+                    connection_tx.send(connection).ok();
+                    futures::future::pending::<Result<(), acp::Error>>().await
+                },
+            ));
+        let connection = connection_rx.await.expect("client connection");
+        let mut list = AcpSessionList::new(connection, false);
+        let session_id = acp_v2::SessionId::new("session-1");
+        assert!(
+            cx.update(|cx| list.list_groups("project", cx))
+                .await
+                .is_err()
+        );
+        assert!(
+            cx.update(|cx| list.get_session_attributes(&session_id, cx))
+                .await
+                .is_err()
+        );
+        list.supports_groups = true;
+        list.supports_session_attributes = true;
+        assert_eq!(
+            cx.update(|cx| list.get_session_attributes(&session_id, cx))
+                .await
+                .expect("get")["session"],
+            "session-1"
+        );
+        let patch =
+            serde_json::Map::from_iter([("gorynych/group".into(), serde_json::Value::Null)]);
+        assert_eq!(
+            cx.update(|cx| list.patch_session_attributes(&session_id, patch.clone(), cx))
+                .await
+                .expect("patch"),
+            patch
+        );
+        let groups = cx
+            .update(|cx| list.list_groups("project", cx))
+            .await
+            .expect("list");
+        assert_eq!(groups[0].group_id, "project");
+        let group = acp_thread::SessionGroup {
+            group_id: "id".into(),
+            name: "New".into(),
+        };
+        assert_eq!(
+            cx.update(|cx| list.set_group("project", group.clone(), cx))
+                .await
+                .expect("set"),
+            group
+        );
+        cx.update(|cx| list.delete_group("project", "id", cx))
+            .await
+            .expect("delete");
     }
 
     #[gpui::test]
@@ -315,7 +436,9 @@ mod tests {
         let client_connection = connection_rx.await.expect("client connection");
         let agent_connection = agent_connection_rx.await.expect("agent connection");
 
-        let session_list = Rc::new(AcpSessionList::new(client_connection, false));
+        let mut session_list = AcpSessionList::new(client_connection, false);
+        session_list.supports_groups = true;
+        let session_list = Rc::new(session_list);
         session_list.apply_change(SessionsChangedNotification {
             session_id: "unwatched".into(),
             change: SessionChange::Added,
@@ -364,6 +487,11 @@ mod tests {
                 .expect("untyped notification"),
             )
             .expect("send future change kind");
+        agent_connection
+            .send_notification(GroupsChangedNotification {
+                project_key: "project".into(),
+            })
+            .expect("send groups changed");
 
         let mut received = Vec::new();
         for _ in 0..10 {
@@ -374,16 +502,211 @@ mod tests {
             while let Ok(update) = updates.try_recv() {
                 received.push(update);
             }
-            if received.len() >= 3 {
+            if received.len() >= 4 {
                 break;
             }
         }
-        assert_eq!(received.len(), 3, "received {received:?}");
+        assert_eq!(received.len(), 4, "received {received:?}");
         assert!(matches!(received[0], SessionListUpdate::Refresh));
         assert!(matches!(
             &received[1],
             SessionListUpdate::SessionRemoved { session_id } if session_id.0.as_ref() == "child-1"
         ));
         assert!(matches!(received[2], SessionListUpdate::Refresh));
+        assert!(
+            matches!(&received[3], SessionListUpdate::GroupsChanged { project_key } if project_key == "project")
+        );
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_gorynych/groups_changed")]
+#[serde(rename_all = "camelCase")]
+pub struct GroupsChangedNotification {
+    pub project_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_gorynych/session_attributes/get", response = AttributesResponse)]
+#[serde(rename_all = "camelCase")]
+struct GetAttributesRequest {
+    session_id: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_gorynych/session_attributes/patch", response = AttributesResponse)]
+#[serde(rename_all = "camelCase")]
+struct PatchAttributesRequest {
+    session_id: String,
+    patch: acp_thread::SessionAttributes,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+struct AttributesResponse {
+    attributes: acp_thread::SessionAttributes,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_gorynych/groups/list", response = ListGroupsResponse)]
+#[serde(rename_all = "camelCase")]
+struct ListGroupsRequest {
+    project_key: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+struct ListGroupsResponse {
+    groups: Vec<acp_thread::SessionGroup>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_gorynych/groups/set", response = SetGroupResponse)]
+#[serde(rename_all = "camelCase")]
+struct SetGroupRequest {
+    project_key: String,
+    group_id: String,
+    name: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+struct SetGroupResponse {
+    group: acp_thread::SessionGroup,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_gorynych/groups/delete", response = serde_json::Value)]
+#[serde(rename_all = "camelCase")]
+struct DeleteGroupRequest {
+    project_key: String,
+    group_id: String,
+}
+
+pub(super) fn advertises_extension(capabilities: &acp::AgentCapabilities, key: &str) -> bool {
+    advertises(capabilities, None, key)
+}
+
+pub(super) fn handle_groups_changed(
+    notification: GroupsChangedNotification,
+    _cx: &mut AsyncApp,
+    context: &ClientContext,
+) {
+    if let Some(list) = context.session_list.borrow().clone() {
+        if list.supports_groups && list.updates_tx.receiver_count() > 1 {
+            if let Err(error) =
+                list.updates_tx
+                    .try_send(acp_thread::SessionListUpdate::GroupsChanged {
+                        project_key: notification.project_key,
+                    })
+            {
+                log::warn!("Failed to forward a groups change: {error}");
+            }
+        }
+    }
+}
+
+impl AcpSessionList {
+    pub(super) fn send_get_attributes(
+        &self,
+        session_id: &acp_v2::SessionId,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::SessionAttributes>> {
+        if !self.supports_session_attributes {
+            return Task::ready(Err(anyhow!("session attributes not supported")));
+        }
+        let connection = self.connection.clone();
+        let request = GetAttributesRequest {
+            session_id: session_id.0.to_string(),
+        };
+        cx.foreground_executor().spawn(async move {
+            Ok(connection
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(crate::acp::map_acp_error)?
+                .attributes)
+        })
+    }
+    pub(super) fn send_patch_attributes(
+        &self,
+        session_id: &acp_v2::SessionId,
+        patch: acp_thread::SessionAttributes,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::SessionAttributes>> {
+        if !self.supports_session_attributes {
+            return Task::ready(Err(anyhow!("session attributes not supported")));
+        }
+        let connection = self.connection.clone();
+        let request = PatchAttributesRequest {
+            session_id: session_id.0.to_string(),
+            patch,
+        };
+        cx.foreground_executor().spawn(async move {
+            Ok(connection
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(crate::acp::map_acp_error)?
+                .attributes)
+        })
+    }
+    pub(super) fn send_list_groups(
+        &self,
+        project_key: &str,
+        cx: &mut App,
+    ) -> Task<Result<Vec<acp_thread::SessionGroup>>> {
+        if !self.supports_groups {
+            return Task::ready(Err(anyhow!("session groups not supported")));
+        }
+        let connection = self.connection.clone();
+        let request = ListGroupsRequest {
+            project_key: project_key.to_owned(),
+        };
+        cx.foreground_executor().spawn(async move {
+            Ok(connection
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(crate::acp::map_acp_error)?
+                .groups)
+        })
+    }
+    pub(super) fn send_set_group(
+        &self,
+        project_key: &str,
+        group: acp_thread::SessionGroup,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::SessionGroup>> {
+        if !self.supports_groups {
+            return Task::ready(Err(anyhow!("session groups not supported")));
+        }
+        let connection = self.connection.clone();
+        let request = SetGroupRequest {
+            project_key: project_key.to_owned(),
+            group_id: group.group_id,
+            name: group.name,
+        };
+        cx.foreground_executor().spawn(async move {
+            Ok(connection
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(crate::acp::map_acp_error)?
+                .group)
+        })
+    }
+    pub(super) fn send_delete_group(
+        &self,
+        project_key: &str,
+        group_id: &str,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        if !self.supports_groups {
+            return Task::ready(Err(anyhow!("session groups not supported")));
+        }
+        let connection = self.connection.clone();
+        let request = DeleteGroupRequest {
+            project_key: project_key.to_owned(),
+            group_id: group_id.to_owned(),
+        };
+        cx.foreground_executor().spawn(async move {
+            connection
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(crate::acp::map_acp_error)?;
+            Ok(())
+        })
     }
 }

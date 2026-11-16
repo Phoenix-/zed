@@ -36,6 +36,7 @@ pub(crate) struct ThreadTreeRow {
 
 pub(crate) struct TreeNode {
     pub agent_id: Option<AgentId>,
+    pub service_id: Option<String>,
     pub session_id: Option<acp::SessionId>,
     pub parent_session_id: Option<acp::SessionId>,
     pub sort_time: DateTime<Utc>,
@@ -66,6 +67,12 @@ fn resolve_parent(
         .iter()
         .copied()
         .filter(|candidate| *candidate != index)
+        .filter(
+            |candidate| match (&node.service_id, &nodes[*candidate].service_id) {
+                (Some(child), Some(parent)) => child == parent,
+                _ => true,
+            },
+        )
         .collect::<Vec<_>>();
     candidates
         .iter()
@@ -80,7 +87,7 @@ fn resolve_parent(
 /// Orders `nodes` so that each one follows its parent, most recent first among
 /// siblings. A subtree is as recent as its most recent node. Descendants of
 /// collapsed nodes are left out.
-pub(crate) fn arrange(nodes: &[TreeNode]) -> Vec<TreePlacement> {
+fn resolved_parents(nodes: &[TreeNode]) -> Vec<Option<usize>> {
     let mut index_by_session = HashMap::<&acp::SessionId, Vec<usize>>::new();
     for (index, node) in nodes.iter().enumerate() {
         if let Some(session_id) = node.session_id.as_ref() {
@@ -104,6 +111,25 @@ pub(crate) fn arrange(nodes: &[TreeNode]) -> Vec<TreePlacement> {
         }
     }
 
+    parents
+}
+
+/// Membership must follow parents before search or collapse can hide those parents.
+pub(crate) fn root_indices(nodes: &[TreeNode]) -> Vec<usize> {
+    let parents = resolved_parents(nodes);
+    (0..nodes.len())
+        .map(|index| {
+            let mut root = index;
+            while let Some(parent) = parents[root] {
+                root = parent;
+            }
+            root
+        })
+        .collect()
+}
+
+pub(crate) fn arrange(nodes: &[TreeNode]) -> Vec<TreePlacement> {
+    let parents = resolved_parents(nodes);
     let mut children = vec![Vec::new(); nodes.len()];
     let mut roots = Vec::new();
     for (index, parent) in parents.iter().enumerate() {
@@ -194,7 +220,9 @@ pub(crate) fn nest_group_rows(
                     .parent_session_id(&SessionSource::of_thread(&thread.metadata), session_id)
             })
             .cloned(),
-        ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+        ListEntry::Terminal(_)
+        | ListEntry::ProjectHeader { .. }
+        | ListEntry::SessionGroupHeader { .. } => None,
     };
     if !entries[group_start..]
         .iter()
@@ -209,6 +237,13 @@ pub(crate) fn nest_group_rows(
         .map(|entry| match entry {
             ListEntry::Thread(thread) => TreeNode {
                 agent_id: Some(thread.metadata.agent_id.clone()),
+                service_id: agent_ui::session_groups::SessionGroups::try_global(cx)
+                    .and_then(|store| {
+                        store
+                            .read(cx)
+                            .list_for_source(&SessionSource::of_thread(&thread.metadata))
+                    })
+                    .and_then(|list| list.service_id().map(str::to_owned)),
                 session_id: thread.metadata.session_id.clone(),
                 parent_session_id: parent_of(entry),
                 sort_time: if thread.draft == Some(DraftKind::Empty) {
@@ -220,13 +255,15 @@ pub(crate) fn nest_group_rows(
             },
             ListEntry::Terminal(terminal) => TreeNode {
                 agent_id: None,
+                service_id: None,
                 session_id: None,
                 parent_session_id: None,
                 sort_time: terminal.metadata.created_at,
                 collapsed: false,
             },
-            ListEntry::ProjectHeader { .. } => TreeNode {
+            ListEntry::ProjectHeader { .. } | ListEntry::SessionGroupHeader { .. } => TreeNode {
                 agent_id: None,
+                service_id: None,
                 session_id: None,
                 parent_session_id: None,
                 sort_time: DateTime::<Utc>::MAX_UTC,
@@ -350,7 +387,9 @@ impl Sidebar {
             let entries = &self.contents.entries;
             let is_toggled_thread = |entry: &ListEntry| match entry {
                 ListEntry::Thread(thread) => thread.metadata.thread_id == thread_id,
-                ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => false,
+                ListEntry::Terminal(_)
+                | ListEntry::ProjectHeader { .. }
+                | ListEntry::SessionGroupHeader { .. } => false,
             };
             self.selection = entries
                 .iter()
@@ -458,6 +497,7 @@ mod tests {
     fn agent_node(agent: &str, session: &str, parent: Option<&str>, minute: u32) -> TreeNode {
         TreeNode {
             agent_id: Some(AgentId::new(agent)),
+            service_id: None,
             session_id: Some(acp::SessionId::new(session)),
             parent_session_id: parent.map(acp::SessionId::new),
             sort_time: DateTime::parse_from_rfc3339(&format!("2026-11-07T10:{minute:02}:00Z"))
@@ -507,6 +547,26 @@ mod tests {
                 "    reviewer",
             ]
         );
+    }
+
+    #[test]
+    fn test_group_roots_follow_cross_agent_parent_and_reattach_orphan() {
+        let mut nodes = vec![
+            agent_node("coder", "child", Some("parent"), 20),
+            agent_node("reviewer", "grandchild", Some("child"), 30),
+        ];
+        assert_eq!(root_indices(&nodes), [0, 0]);
+        nodes.push(agent_node("coordinator", "parent", None, 10));
+        assert_eq!(root_indices(&nodes), [2, 2, 2]);
+    }
+
+    #[test]
+    fn test_parent_from_another_service_does_not_attach() {
+        let mut child = agent_node("coder", "child", Some("parent"), 20);
+        child.service_id = Some("service-a".into());
+        let mut parent = agent_node("coordinator", "parent", None, 10);
+        parent.service_id = Some("service-b".into());
+        assert_eq!(root_indices(&[child, parent]), [0, 1]);
     }
 
     #[test]

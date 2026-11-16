@@ -53,7 +53,7 @@ use crate::{CURSOR_ID, GEMINI_ID};
 
 mod session_list_changes;
 pub(crate) mod session_state;
-use session_list_changes::handle_sessions_changed;
+use session_list_changes::{handle_groups_changed, handle_sessions_changed};
 use session_state::{SessionStateExtension, handle_session_state_notification};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
@@ -319,6 +319,9 @@ pub struct AcpSessionList {
     notifies_changes: bool,
     supports_archive: bool,
     supports_session_state: bool,
+    supports_session_attributes: bool,
+    supports_groups: bool,
+    service_id: Option<String>,
     updates_tx: async_channel::Sender<acp_thread::SessionListUpdate>,
     updates_rx: async_channel::Receiver<acp_thread::SessionListUpdate>,
 }
@@ -332,6 +335,9 @@ impl AcpSessionList {
             notifies_changes: false,
             supports_archive: false,
             supports_session_state: false,
+            supports_session_attributes: false,
+            supports_groups: false,
+            service_id: None,
             updates_tx: tx,
             updates_rx: rx,
         }
@@ -372,6 +378,49 @@ impl AcpSessionList {
 }
 
 impl AgentSessionList for AcpSessionList {
+    fn service_id(&self) -> Option<&str> {
+        self.service_id.as_deref()
+    }
+    fn supports_session_attributes(&self) -> bool {
+        self.supports_session_attributes
+    }
+    fn supports_groups(&self) -> bool {
+        self.supports_groups
+    }
+
+    fn get_session_attributes(
+        &self,
+        session_id: &acp_v2::SessionId,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::SessionAttributes>> {
+        self.send_get_attributes(session_id, cx)
+    }
+    fn patch_session_attributes(
+        &self,
+        session_id: &acp_v2::SessionId,
+        patch: acp_thread::SessionAttributes,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::SessionAttributes>> {
+        self.send_patch_attributes(session_id, patch, cx)
+    }
+    fn list_groups(
+        &self,
+        project_key: &str,
+        cx: &mut App,
+    ) -> Task<Result<Vec<acp_thread::SessionGroup>>> {
+        self.send_list_groups(project_key, cx)
+    }
+    fn set_group(
+        &self,
+        project_key: &str,
+        group: acp_thread::SessionGroup,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::SessionGroup>> {
+        self.send_set_group(project_key, group, cx)
+    }
+    fn delete_group(&self, project_key: &str, group_id: &str, cx: &mut App) -> Task<Result<()>> {
+        self.send_delete_group(project_key, group_id, cx)
+    }
     fn list_sessions(
         &self,
         request: AgentSessionListRequest,
@@ -600,6 +649,10 @@ fn client_builder(
         )
         .on_receive_notification(
             on_notification!(handle_sessions_changed),
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_notification(
+            on_notification!(handle_groups_changed),
             agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_notification(
@@ -848,6 +901,20 @@ impl AcpConnection {
                 response.meta.as_ref(),
             );
             list.supports_session_state = reports_session_state;
+            list.supports_session_attributes = session_list_changes::advertises_extension(
+                &response.agent_capabilities,
+                "gorynych/sessionAttributes",
+            );
+            list.supports_groups = session_list_changes::advertises_extension(
+                &response.agent_capabilities,
+                "gorynych/groups",
+            );
+            list.service_id = response
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("gorynych/serviceId"))
+                .and_then(|value| value.as_str())
+                .map(str::to_owned);
             let list = Rc::new(list);
             *client_session_list.borrow_mut() = Some(list.clone());
             Some(list)
@@ -1533,6 +1600,24 @@ impl AgentConnection for AcpConnection {
         work_dirs: PathList,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
+        self.new_session_with_attributes(project, work_dirs, Default::default(), cx)
+    }
+
+    fn new_session_with_attributes(
+        self: Rc<Self>,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        attributes: acp_thread::SessionAttributes,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        if !attributes.is_empty()
+            && !self
+                .session_list
+                .as_ref()
+                .is_some_and(|list| list.supports_session_attributes)
+        {
+            return Task::ready(Err(anyhow!("initial session attributes not supported")));
+        }
         let directories = match self.session_directories_from_work_dirs(&work_dirs) {
             Ok(directories) => directories,
             Err(error) => return Task::ready(Err(error)),
@@ -1543,9 +1628,11 @@ impl AgentConnection for AcpConnection {
         cx.spawn(async move |cx| {
             let (response_sender, response_received) = futures::channel::oneshot::channel();
             let (registered, registration_finished) = futures::channel::oneshot::channel();
-            let request = self
-                .connection
-                .prepare_request(directories.into_new_session_request(mcp_servers));
+            let mut session_request = directories.into_new_session_request(mcp_servers);
+            if !attributes.is_empty() {
+                session_request.meta = Some(acp::Meta::from_iter([("gorynych/attributes".into(), serde_json::Value::Object(attributes))]));
+            }
+            let request = self.connection.prepare_request(session_request);
             let cancellation = request.cancellation_handle();
             request
                 .on_receiving_result({
@@ -2807,6 +2894,70 @@ mod tests {
     }
     use futures::StreamExt as _;
     use settings::Settings as _;
+
+    #[gpui::test]
+    async fn new_session_sends_initial_group_attributes(cx: &mut gpui::TestAppContext) {
+        init_settings_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({"a": {}})).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let mut harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let (request_sender, request_receiver) = futures::channel::oneshot::channel();
+        let sender = Arc::new(Mutex::new(Some(request_sender)));
+        let _agent_task = cx.background_spawn(
+            Agent
+                .builder()
+                .name("group-draft-agent")
+                .on_receive_request(
+                    async move |request: acp::NewSessionRequest, responder, _cx| {
+                        if let Some(sender) = sender.lock().expect("sender").take() {
+                            sender.send(request.meta).ok();
+                        }
+                        responder.respond(acp::NewSessionResponse::new("group-draft"))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_transport),
+        );
+        let (connection_sender, connection_receiver) = futures::channel::oneshot::channel();
+        let _client_task = cx.background_spawn(connect_client_future(
+            "group-draft-client",
+            client_transport,
+            harness.connection.dispatch_tx.clone(),
+            connection_sender,
+            futures::future::pending(),
+        ));
+        let connection = connection_receiver.await.expect("SDK connection");
+        let mut list = AcpSessionList::new(connection.clone(), false);
+        list.supports_session_attributes = true;
+        let harness_connection =
+            Rc::get_mut(&mut harness.connection).expect("sole connection owner");
+        harness_connection.connection = connection;
+        harness_connection.session_list = Some(Rc::new(list));
+        let attributes = acp_thread::SessionAttributes::from_iter([(
+            "gorynych/group".into(),
+            serde_json::json!({"projectKey":"project", "groupId":"group"}),
+        )]);
+        cx.update(|cx| {
+            harness.connection.clone().new_session_with_attributes(
+                project,
+                PathList::new(&[std::path::PathBuf::from("/a")]),
+                attributes.clone(),
+                cx,
+            )
+        })
+        .await
+        .expect("new grouped session");
+        let meta = request_receiver
+            .await
+            .expect("request observed")
+            .expect("initial meta");
+        assert_eq!(
+            meta.get("gorynych/attributes"),
+            Some(&serde_json::Value::Object(attributes))
+        );
+    }
 
     #[gpui::test(iterations = 10)]
     async fn steering_uses_the_sdk_transport_and_session_capability(cx: &mut gpui::TestAppContext) {

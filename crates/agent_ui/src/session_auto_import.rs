@@ -58,6 +58,7 @@ use crate::{
     agent_connection_store::{AgentConnectionEntry, AgentConnectionStore},
     open_elsewhere_store::{OpenElsewhereStore, open_elsewhere_from_meta},
     session_activity_store::SessionActivityStore,
+    session_groups::{SessionGroups, attributes_from_meta},
     thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore, WorktreePaths},
     thread_parent_store::{ThreadParentStore, parent_session_id_from_meta},
 };
@@ -120,6 +121,13 @@ impl SessionSource {
 
     pub fn local(agent_id: AgentId) -> Self {
         Self::new(agent_id, None)
+    }
+
+    pub fn is_on_host(&self, remote: Option<&RemoteConnectionOptions>) -> bool {
+        self.remote.as_deref()
+            == remote
+                .map(|host| remote_connection_identity(host).persistence_key())
+                .as_deref()
     }
 
     /// The source of the thread's session.
@@ -647,6 +655,11 @@ impl SessionAutoImport {
         cx: &mut Context<Self>,
     ) {
         let source = SessionSource::new(agent_id, remote_connection.as_ref());
+        if let Some(store) = SessionGroups::try_global(cx) {
+            store.update(cx, |store, cx| {
+                store.register(source.clone(), &session_list, cx)
+            });
+        }
         if self.is_watching(&source) {
             return;
         }
@@ -745,6 +758,22 @@ impl SessionAutoImport {
         listing: SessionListing,
         cx: &mut Context<Self>,
     ) {
+        let live_sessions = self.live_sessions(source, cx);
+        if session_list.supports_session_attributes()
+            && let Some(store) = SessionGroups::try_global(cx)
+        {
+            let attributes = listing
+                .sessions
+                .iter()
+                .filter_map(|session| {
+                    attributes_from_meta(session.meta.as_ref())
+                        .map(|attributes| (session.session_id.clone(), attributes))
+                })
+                .collect::<Vec<_>>();
+            store.update(cx, |store, cx| {
+                store.apply_listing(source, attributes, listing.complete, &live_sessions, cx)
+            });
+        }
         if listing.archive {
             // The listing reports the flags of these sessions, so earlier requests
             // either took effect or are made again.
@@ -790,7 +819,6 @@ impl SessionAutoImport {
             });
         }
         let open_thread_ids = self.open_thread_ids(cx);
-        let live_sessions = self.live_sessions(source, cx);
         let store = ThreadMetadataStore::global(cx);
         // The listing is authoritative for the parents of the sessions it contains.
         let parent_links = listing
@@ -803,6 +831,25 @@ impl SessionAutoImport {
                 )
             })
             .collect::<Vec<_>>();
+        let listed_drafts = {
+            let threads = agent_threads(store.read(cx), source);
+            listing
+                .sessions
+                .iter()
+                .filter_map(|session| {
+                    threads
+                        .get(&session.session_id)
+                        .map(|thread| thread.thread_id)
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Some(groups) = SessionGroups::try_global(cx) {
+            groups.update(cx, |groups, _| {
+                for thread_id in listed_drafts {
+                    groups.finish_pending_draft(thread_id);
+                }
+            });
+        }
         let threads = agent_threads(store.read(cx), source);
         let mut sessions_with_threads = threads
             .keys()
@@ -876,6 +923,14 @@ impl SessionAutoImport {
     ) {
         let mut info = AgentSessionInfo::new(session_id.clone());
         info.apply_update(update);
+        if session_list.supports_session_attributes()
+            && let Some(attributes) = attributes_from_meta(info.meta.as_ref())
+            && let Some(store) = SessionGroups::try_global(cx)
+        {
+            store.update(cx, |store, cx| {
+                store.set_attributes(source, session_id.clone(), attributes, cx)
+            });
+        }
         if session_list.supports_archive()
             && let Some(archived) = archived_from_meta(info.meta.as_ref())
         {
@@ -1392,6 +1447,13 @@ async fn watch_session_list(
         for update in pending_updates {
             match update {
                 SessionListUpdate::Refresh => needs_listing = true,
+                SessionListUpdate::GroupsChanged { project_key } => {
+                    cx.update(|cx| {
+                        if let Some(store) = SessionGroups::try_global(cx) {
+                            store.update(cx, |store, cx| store.refresh_project(&project_key, cx));
+                        }
+                    });
+                }
                 SessionListUpdate::SessionRemoved { session_id } => {
                     this.update(cx, |this, cx| this.remove_session(&source, &session_id, cx))
                         .ok();

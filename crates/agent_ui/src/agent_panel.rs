@@ -933,6 +933,8 @@ fn thread_metadata_to_debug_json(
 /// needs to override what it actually cares about.
 #[derive(Default)]
 pub struct CreateThreadOptions {
+    /// An identity reserved by the caller before asynchronous session creation.
+    pub thread_id: Option<ThreadId>,
     /// Title to assign to the new thread up front.
     pub title: Option<SharedString>,
     /// Initial content to populate in the thread (optionally auto-submitted).
@@ -3252,7 +3254,7 @@ impl AgentPanel {
         let thread = self.create_agent_thread_with_server(
             agent,
             None,
-            None,
+            options.thread_id,
             options.work_dirs,
             options.title.clone(),
             options.initial_content,
@@ -4886,6 +4888,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 agent: agent_choice.clone(),
                 model: request.model.clone(),
                 work_dirs: None,
+                thread_id: None,
             };
 
             // If the caller asked for a fresh worktree, open a new workspace

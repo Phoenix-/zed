@@ -1397,6 +1397,13 @@ impl ConversationView {
             );
 
             let mut resumed_without_history = false;
+            let pending_attributes = this
+                .read_with(cx, |this, cx| {
+                    crate::session_groups::SessionGroups::try_global(cx)
+                        .and_then(|store| store.read(cx).pending_draft(this.thread_id))
+                })
+                .ok()
+                .flatten();
             let Some(recovering) = this
                 .read_with(cx, |this, _| this.recovery.is_some())
                 .log_err()
@@ -1435,9 +1442,27 @@ impl ConversationView {
                 .log_err()
             } else {
                 cx.update(|_, cx| {
-                    connection
-                        .clone()
-                        .new_session(project.clone(), session_work_dirs, cx)
+                    if let Some((service_id, attributes)) = pending_attributes.clone() {
+                        let matches_service = connection.session_list(cx).is_some_and(|list| {
+                            list.supports_session_attributes()
+                                && list.service_id() == Some(service_id.as_str())
+                        });
+                        if !matches_service {
+                            return Task::ready(Err(anyhow!(
+                                "The selected agent is not connected to the session group service."
+                            )));
+                        }
+                        connection.clone().new_session_with_attributes(
+                            project.clone(),
+                            session_work_dirs,
+                            attributes,
+                            cx,
+                        )
+                    } else {
+                        connection
+                            .clone()
+                            .new_session(project.clone(), session_work_dirs, cx)
+                    }
                 })
                 .log_err()
             };
@@ -1463,6 +1488,19 @@ impl ConversationView {
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(thread) => {
+                        if let Some((_, attributes)) = pending_attributes.clone()
+                            && let Some(store) =
+                                crate::session_groups::SessionGroups::try_global(cx)
+                        {
+                            let source = crate::session_auto_import::SessionSource::new(
+                                connection.agent_id(),
+                                this.project.read(cx).remote_connection_options(cx).as_ref(),
+                            );
+                            let session_id = thread.read(cx).session_id().clone();
+                            store.update(cx, |store, cx| {
+                                store.set_initial_attributes(&source, session_id, attributes, cx);
+                            });
+                        }
                         if let Some(recovery) = &this.recovery {
                             thread.update(cx, |thread, cx| {
                                 thread.set_draft_prompt(Some(recovery.draft.clone()), cx);
