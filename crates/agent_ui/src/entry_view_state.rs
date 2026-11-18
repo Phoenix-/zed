@@ -66,7 +66,7 @@ pub struct EntryViewState {
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
     /// Subagent cards shown for an ACP parent's outgoing session messages.
-    expanded_session_message_cards: HashSet<acp_v2::MessageId>,
+    expanded_acp_subagent_cards: HashSet<acp_v2::SessionId>,
 }
 
 impl EntryViewState {
@@ -89,7 +89,7 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
-            expanded_session_message_cards: HashSet::default(),
+            expanded_acp_subagent_cards: HashSet::default(),
         }
     }
 
@@ -115,14 +115,13 @@ impl EntryViewState {
         }
     }
 
-    pub(crate) fn is_session_message_card_expanded(&self, message_id: &acp_v2::MessageId) -> bool {
-        self.expanded_session_message_cards.contains(message_id)
+    pub(crate) fn is_acp_subagent_card_expanded(&self, session_id: &acp_v2::SessionId) -> bool {
+        self.expanded_acp_subagent_cards.contains(session_id)
     }
 
-    pub(crate) fn toggle_session_message_card_expansion(&mut self, message_id: &acp_v2::MessageId) {
-        if !self.expanded_session_message_cards.remove(message_id) {
-            self.expanded_session_message_cards
-                .insert(message_id.clone());
+    pub(crate) fn toggle_acp_subagent_card_expansion(&mut self, session_id: &acp_v2::SessionId) {
+        if !self.expanded_acp_subagent_cards.remove(session_id) {
+            self.expanded_acp_subagent_cards.insert(session_id.clone());
         }
     }
 

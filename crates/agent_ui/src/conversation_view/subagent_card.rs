@@ -3,6 +3,7 @@ use acp_thread::{
     ToolCallStatus,
 };
 use agent_client_protocol::schema::v2 as acp_v2;
+use collections::HashSet;
 use gpui::{App, Entity, SharedString};
 use std::{fmt, ops::Range};
 
@@ -11,21 +12,21 @@ use super::thread_view::{SessionMessageSide, session_message_side, subagent_labe
 /// Native subagent tool calls report a user cancellation as output with this text.
 const USER_CANCELED_OUTPUT: &str = "User canceled";
 
-/// The transcript entry a subagent card stands for. It keys the card's expansion state
-/// and element IDs, since the same subagent can have more than one card.
+/// Keys a card's expansion state and element IDs. An ACP card keeps its identity
+/// when it moves from the end of the transcript to an outgoing message.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SubagentCardId {
     /// A native `spawn_agent` tool call.
     ToolCall(acp_v2::ToolCallId),
-    /// An ACP parent's outgoing session message to the subagent.
-    SessionMessage(acp_v2::MessageId),
+    /// A child session announced by the ACP agent.
+    AcpSession(acp_v2::SessionId),
 }
 
 impl fmt::Display for SubagentCardId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ToolCall(id) => write!(f, "tool-call-{id}"),
-            Self::SessionMessage(id) => write!(f, "session-message-{id}"),
+            Self::AcpSession(id) => write!(f, "acp-session-{id}"),
         }
     }
 }
@@ -40,26 +41,54 @@ pub(crate) fn acp_subagent_card(
     entry_ix: usize,
     message: &SessionMessage,
 ) -> Option<(SubagentCardId, Entity<AcpThread>)> {
-    let own_session_id = thread.session_id();
-    let SessionMessageSide::Outgoing {
-        recipient: Some(recipient),
-    } = session_message_side(message, own_session_id)
-    else {
-        return None;
-    };
+    let recipient = card_recipient(message, thread.session_id())?;
     let subagent = thread.subagent(recipient)?.clone();
-    let MessageIdentity::Keyed(message_id) = &message.identity else {
-        return None;
-    };
     let sent_earlier = thread.entries().get(..entry_ix)?.iter().any(|entry| {
-        matches!(
-            entry,
-            AgentThreadEntry::SessionMessage(earlier)
-                if session_message_side(earlier, own_session_id)
-                    == SessionMessageSide::Outgoing { recipient: Some(recipient) }
-        )
+        matches!(entry, AgentThreadEntry::SessionMessage(earlier)
+            if card_recipient(earlier, thread.session_id()) == Some(recipient))
     });
-    (!sent_earlier).then(|| (SubagentCardId::SessionMessage(message_id.clone()), subagent))
+    (!sent_earlier).then(|| (SubagentCardId::AcpSession(recipient.clone()), subagent))
+}
+
+pub(crate) fn acp_subagents_without_message(
+    thread: &AcpThread,
+    cx: &App,
+) -> Vec<Entity<AcpThread>> {
+    let mut subagents = thread
+        .subagents()
+        .filter(|subagent| subagent.read(cx).subagent_association().is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    if subagents.is_empty() {
+        return subagents;
+    }
+
+    let recipients = thread
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            AgentThreadEntry::SessionMessage(message) => {
+                card_recipient(message, thread.session_id())
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    subagents.retain(|subagent| !recipients.contains(subagent.read(cx).session_id()));
+    subagents
+}
+
+fn card_recipient<'a>(
+    message: &'a SessionMessage,
+    own_session_id: &acp_v2::SessionId,
+) -> Option<&'a acp_v2::SessionId> {
+    match session_message_side(message, own_session_id) {
+        SessionMessageSide::Outgoing { recipient }
+            if matches!(message.identity, MessageIdentity::Keyed(_)) =>
+        {
+            recipient
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

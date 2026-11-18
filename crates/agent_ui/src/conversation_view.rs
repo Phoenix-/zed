@@ -2074,6 +2074,14 @@ impl ConversationView {
             }
             AcpThreadEvent::SubagentSpawned(subagent_session_id) => {
                 if let Some(subagent) = thread.read(cx).subagent(subagent_session_id).cloned() {
+                    if subagent.read(cx).subagent_association().is_some()
+                        && let Some(parent_view) = self.thread_view(&session_id)
+                    {
+                        parent_view.update(cx, |parent, cx| {
+                            parent.sync_editor_mode(cx);
+                            cx.notify();
+                        });
+                    }
                     self.add_subagent_thread_view(subagent, window, cx);
                 }
             }
@@ -21274,7 +21282,7 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_first_message_to_an_acp_subagent_shows_its_card(cx: &mut TestAppContext) {
+    async fn test_acp_subagent_card_can_open_before_its_first_message(cx: &mut TestAppContext) {
         init_test(cx);
         let connection = StubAgentConnection::new();
         let (conversation_view, cx) =
@@ -21310,6 +21318,45 @@ pub(crate) mod tests {
         });
         // Each ACP notification is applied in its own update, as here.
         root.update(cx, |root, cx| root.register_subagent(child.clone(), cx));
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("subagent-card-0").is_some());
+        let open_subagent = cx
+            .debug_bounds("open-subagent-0")
+            .expect("an announced subagent can open even before it has a transcript");
+        cx.simulate_click(open_subagent.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            active_thread(&conversation_view, cx).read_with(cx, |view, cx| view
+                .thread
+                .read(cx)
+                .session_id()
+                .clone()),
+            acp_v2::SessionId::new("child"),
+        );
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(root_session_id.clone(), window, cx);
+        });
+        child
+            .update(cx, |child, cx| {
+                child.upsert_assistant_message(
+                    acp_v2::AgentMessage::new("child-reply").content(vec!["Found it".into()]),
+                    cx,
+                )
+            })
+            .expect("child transcript");
+        cx.run_until_parked();
+        let title = cx
+            .debug_bounds("subagent-title-0")
+            .expect("the announced subagent has a card");
+        cx.simulate_click(title.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("open-subagent-0").is_some(),
+            "the card expands to preview the subagent's transcript"
+        );
+
         for (message_id, text) in [
             ("launch", "Check the failure"),
             ("follow-up", "Also check Windows"),
@@ -21332,6 +21379,10 @@ pub(crate) mod tests {
             "the first message to the subagent is its card"
         );
         assert!(
+            cx.debug_bounds("open-subagent-0").is_some(),
+            "the first message preserves the card's expanded state"
+        );
+        assert!(
             cx.debug_bounds("subagent-card-1").is_none()
                 && cx.debug_bounds("session-message-participant-1").is_some(),
             "a later message to the same subagent stays a row"
@@ -21342,6 +21393,11 @@ pub(crate) mod tests {
         );
 
         let thread_view = active_thread(&conversation_view, cx);
+        assert_eq!(
+            thread_view.read_with(cx, |view, _| view.list_state.item_count()),
+            2,
+            "the outgoing message takes over the existing card"
+        );
         thread_view.update_in(cx, |view, window, cx| {
             view.toggle_search(&crate::ToggleSearch, window, cx);
         });

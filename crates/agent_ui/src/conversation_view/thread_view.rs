@@ -55,7 +55,10 @@ use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
-use super::subagent_card::{SubagentCardId, SubagentCardState, SubagentStatus, acp_subagent_card};
+use super::subagent_card::{
+    SubagentCardId, SubagentCardState, SubagentStatus, acp_subagent_card,
+    acp_subagents_without_message,
+};
 use super::*;
 
 /// Which side of a session message a transcript shows, and the other participant when it
@@ -1630,11 +1633,15 @@ impl ThreadView {
     }
 
     fn has_visible_conversation(&self, cx: &App) -> bool {
+        let thread = self.thread.read(cx);
         self.generating_indicator_in_list
-            || self.thread.read(cx).entries().iter().any(|entry| {
+            || thread.entries().iter().any(|entry| {
                 !matches!(entry, AgentThreadEntry::UserMessage(message)
                     if message.content.source_blocks().is_empty())
             })
+            || thread
+                .subagents()
+                .any(|subagent| subagent.read(cx).subagent_association().is_some())
     }
 
     pub(super) fn can_edit_user_message(&self, index: usize, cx: &App) -> bool {
@@ -7547,6 +7554,20 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 
 impl ThreadView {
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
+        let thread = self.thread.read(cx);
+        let subagents_without_message = acp_subagents_without_message(thread, cx);
+        // These cards have no transcript entry. Keep them after the entries and
+        // generating indicator so transcript indices still map to their list items.
+        let first_card = thread.entries().len() + usize::from(self.generating_indicator_in_list);
+        let item_count = first_card + subagents_without_message.len();
+        let old_count = self.list_state.item_count();
+        if item_count != old_count {
+            self.list_state.splice(
+                old_count.min(item_count)..old_count,
+                item_count.saturating_sub(old_count),
+            );
+        }
+
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
             h_flex().w_full().justify_center().child(
@@ -7564,10 +7585,19 @@ impl ThreadView {
                 if let Some(entry) = entries.get(index) {
                     let rendered = this.render_entry(index, entries.len(), entry, window, cx);
                     centered_container(rendered.into_any_element()).into_any_element()
-                } else if this.generating_indicator_in_list {
+                } else if index == entries.len() && this.generating_indicator_in_list {
                     let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
                         || this.has_pending_request_elicitation(cx);
                     let rendered = this.render_generating(confirmation, cx);
+                    centered_container(rendered.into_any_element()).into_any_element()
+                } else if let Some(subagent) = index
+                    .checked_sub(first_card)
+                    .and_then(|index| subagents_without_message.get(index))
+                {
+                    let card_id =
+                        SubagentCardId::AcpSession(subagent.read(cx).session_id().clone());
+                    let rendered =
+                        this.render_acp_subagent_card(index, &card_id, subagent, window, cx);
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else {
                     Empty.into_any()
@@ -12431,6 +12461,7 @@ impl ThreadView {
                     .child(
                         h_flex()
                             .id(format!("subagent-title-{}", entry_ix))
+                            .debug_selector(move || format!("subagent-title-{entry_ix}"))
                             .px_1()
                             .min_w_0()
                             .size_full()
@@ -12531,7 +12562,11 @@ impl ThreadView {
                                         move |this, _, window, cx| {
                                             let expanded =
                                                 this.toggle_subagent_card_expansion(&card_id, cx);
-                                            this.materialize_tool_call_views(entry_ix, window, cx);
+                                            if matches!(card_id, SubagentCardId::ToolCall(_)) {
+                                                this.materialize_tool_call_views(
+                                                    entry_ix, window, cx,
+                                                );
+                                            }
                                             this.refresh_thread_search(window, cx);
                                             telemetry::event!("Subagent Toggled", expanded);
                                             cx.notify();
@@ -12580,6 +12615,7 @@ impl ThreadView {
 
                 let fullscreen_toggle = h_flex()
                     .id(entry_ix)
+                    .debug_selector(move || format!("open-subagent-{entry_ix}"))
                     .py_1()
                     .w_full()
                     .justify_center()
@@ -12638,8 +12674,13 @@ impl ThreadView {
                                     .title(message),
                             )
                         })
-                        .child(fullscreen_toggle)
                     })
+                    .when(
+                        is_expanded
+                            || (!has_expandable_content
+                                && matches!(card_id, SubagentCardId::AcpSession(_))),
+                        |this| this.child(fullscreen_toggle),
+                    )
                 }
             })
             .into_any_element()
@@ -12649,7 +12690,7 @@ impl ThreadView {
         let state = self.entry_view_state.read(cx);
         match card_id {
             SubagentCardId::ToolCall(id) => state.is_tool_call_expanded(id),
-            SubagentCardId::SessionMessage(id) => state.is_session_message_card_expanded(id),
+            SubagentCardId::AcpSession(id) => state.is_acp_subagent_card_expanded(id),
         }
     }
 
@@ -12661,7 +12702,7 @@ impl ThreadView {
     ) -> bool {
         self.entry_view_state.update(cx, |state, _| match card_id {
             SubagentCardId::ToolCall(id) => state.toggle_tool_call_expansion(id),
-            SubagentCardId::SessionMessage(id) => state.toggle_session_message_card_expansion(id),
+            SubagentCardId::AcpSession(id) => state.toggle_acp_subagent_card_expansion(id),
         });
         self.is_subagent_card_expanded(card_id, cx)
     }
