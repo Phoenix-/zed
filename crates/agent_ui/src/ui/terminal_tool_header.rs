@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use gpui::{AnyElement, ClickEvent, CursorStyle, Window};
-use ui::{CommonAnimationExt, Disclosure, Divider, DividerColor, Tooltip, prelude::*};
+use ui::{CommonAnimationExt, Divider, DividerColor, Tooltip, prelude::*};
 use util::time::duration_alt_display;
 
 const ELAPSED_DISPLAY_THRESHOLD: Duration = Duration::from_secs(10);
@@ -22,6 +22,7 @@ pub struct TerminalToolHeader {
     is_expanded: bool,
     elapsed: Option<Duration>,
     running: bool,
+    completed: bool,
     truncated_tooltip: Option<SharedString>,
     failed: bool,
     exit_code: Option<i64>,
@@ -29,6 +30,7 @@ pub struct TerminalToolHeader {
     on_toggle_expand: Option<ClickHandler>,
     on_stop: Option<ClickHandler>,
     command_slot: Option<AnyElement>,
+    show_command_in_row: bool,
 }
 
 impl TerminalToolHeader {
@@ -45,6 +47,7 @@ impl TerminalToolHeader {
             is_expanded,
             elapsed: None,
             running: false,
+            completed: false,
             truncated_tooltip: None,
             failed: false,
             exit_code: None,
@@ -52,6 +55,7 @@ impl TerminalToolHeader {
             on_toggle_expand: None,
             on_stop: None,
             command_slot: None,
+            show_command_in_row: false,
         }
     }
 
@@ -62,6 +66,11 @@ impl TerminalToolHeader {
 
     pub fn running(mut self, running: bool) -> Self {
         self.running = running;
+        self
+    }
+
+    pub fn completed(mut self, completed: bool) -> Self {
+        self.completed = completed;
         self
     }
 
@@ -97,6 +106,11 @@ impl TerminalToolHeader {
         self
     }
 
+    pub fn show_command_in_row(mut self, show: bool) -> Self {
+        self.show_command_in_row = show;
+        self
+    }
+
     pub fn command_slot(mut self, element: impl IntoElement) -> Self {
         self.command_slot = Some(element.into_any_element());
         self
@@ -116,13 +130,15 @@ impl RenderOnce for TerminalToolHeader {
             is_expanded,
             elapsed,
             running,
+            completed,
             truncated_tooltip,
             failed,
             exit_code,
             sandbox_warning,
             on_toggle_expand,
             on_stop,
-            command_slot,
+            mut command_slot,
+            show_command_in_row,
         } = self;
 
         let child_id = |name: &str| format!("terminal-tool-{name}-{id}");
@@ -142,22 +158,45 @@ impl RenderOnce for TerminalToolHeader {
             .gap_1()
             .justify_between()
             .rounded_t_md()
-            .child(
-                div().w_full().min_w_0().overflow_hidden().child(
-                    Label::new(working_dir)
-                        .buffer_font(cx)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate_start(),
-                ),
-            )
-            .child(
-                Disclosure::new(child_id("disclosure"), is_expanded)
-                    .opened_icon(IconName::ChevronUp)
-                    .closed_icon(IconName::ChevronDown)
-                    .visible_on_hover(&hover_group)
-                    .when_some(on_toggle_expand, |this, handler| this.on_click(handler)),
-            )
+            .when(show_command_in_row, |row| {
+                row.child(div().flex_1().min_w_0().children(command_slot.take()))
+            })
+            .when(!show_command_in_row, |row| {
+                row.child(
+                    div().w_full().min_w_0().overflow_hidden().child(
+                        Label::new(working_dir)
+                            .buffer_font(cx)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate_start(),
+                    ),
+                )
+            })
+            .when_some(on_toggle_expand, |header, handler| {
+                let selector = format!("terminal-command-disclosure-{id}");
+                header.child(
+                    div().debug_selector(move || selector.clone()).child(
+                        IconButton::new(
+                            child_id("disclosure"),
+                            if is_expanded {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            },
+                        )
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tab_index(0isize)
+                        .aria_label(if is_expanded {
+                            "Collapse command"
+                        } else {
+                            "Expand command"
+                        })
+                        .aria_expanded(is_expanded)
+                        .on_click(handler),
+                    ),
+                )
+            })
             .when(show_elapsed, |header| {
                 let elapsed = elapsed.unwrap_or_default();
                 header.child(
@@ -222,6 +261,13 @@ impl RenderOnce for TerminalToolHeader {
                             }),
                     )
             })
+            .when(completed && !failed, |header| {
+                header.child(
+                    Icon::new(IconName::Check)
+                        .size(IconSize::Small)
+                        .color(Color::Success),
+                )
+            })
             .when_some(sandbox_warning, |header, warning| {
                 let TerminalSandboxWarning {
                     title,
@@ -255,6 +301,36 @@ impl RenderOnce for TerminalToolHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn command_disclosure_accepts_keyboard_activation(cx: &mut gpui::TestAppContext) {
+        struct Header {
+            expanded: bool,
+        }
+        impl Render for Header {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                TerminalToolHeader::new("keyboard", "keyboard", "/project", self.expanded)
+                    .on_toggle_expand(cx.listener(|this, _, _, cx| {
+                        this.expanded = !this.expanded;
+                        cx.notify();
+                    }))
+            }
+        }
+        crate::test_support::init_test(cx);
+        let (header, cx) = cx.add_window_view(|_, _| Header { expanded: false });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.focus_next(cx));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").expect("valid key"),
+        });
+        assert!(header.read_with(cx, |header, _| header.expanded));
+        cx.simulate_keystrokes("space");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").expect("valid key"),
+        });
+        assert!(!header.read_with(cx, |header, _| header.expanded));
+    }
 
     #[gpui::test]
     fn running_header_only_offers_stop_when_control_is_available(cx: &mut gpui::TestAppContext) {

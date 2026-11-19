@@ -12891,6 +12891,119 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_acp_execute_text_output_disclosure(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    expand_terminal_card: false,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let tool_id = acp_v2::ToolCallId::new("execute-text-disclosure");
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new("execute-text-disclosure", "echo hello\necho second")
+                            .kind(acp_v1::ToolKind::Execute)
+                            .status(acp_v1::ToolCallStatus::InProgress)
+                            .content(vec!["hello output".into()]),
+                    ),
+                    cx,
+                )
+                .expect("execute call");
+        });
+        cx.run_until_parked();
+        let index = thread.read_with(cx, |thread, _| {
+            thread.tool_call(&tool_id).expect("tool call").0
+        });
+        assert_eq!(index, 0);
+        assert!(
+            cx.debug_bounds("command-preview-inner-tool-call-header-0")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("command-full-inner-tool-call-header-0")
+                .is_none()
+        );
+        assert!(cx.debug_bounds("tool-call-output-0-0").is_none());
+        let bounds = cx
+            .debug_bounds("command-card-disclosure-0")
+            .expect("visible disclosure");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("command-preview-inner-tool-call-header-0")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("command-full-inner-tool-call-header-0")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("tool-call-output-0-0").is_some());
+        let bounds = cx
+            .debug_bounds("command-card-disclosure-0")
+            .expect("visible disclosure");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
+                        "execute-text-disclosure",
+                        acp_v1::ToolCallUpdateFields::new()
+                            .status(acp_v1::ToolCallStatus::Completed)
+                            .content(vec!["updated output".into()]),
+                    )),
+                    cx,
+                )
+                .expect("execute update");
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tool-call-output-0-0").is_none(),
+            "late output must not reopen the card"
+        );
+        let entry_state = thread_view.read_with(cx, |view, _| view.entry_view_state.clone());
+        entry_state.update_in(cx, |state, window, cx| {
+            state.sync_entry_initial(index, &thread, window, cx);
+        });
+        assert!(!entry_state.read_with(cx, |state, _| state.is_tool_call_expanded(&tool_id)));
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    expand_terminal_card: true,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new("execute-expanded", "echo expanded")
+                            .kind(acp_v1::ToolKind::Execute)
+                            .status(acp_v1::ToolCallStatus::Completed)
+                            .content(vec!["expanded output".into()]),
+                    ),
+                    cx,
+                )
+                .expect("expanded execute call");
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-output-1-0").is_some());
+        assert!(cx.debug_bounds("tool-call-output-0-0").is_none());
+    }
+
+    #[gpui::test]
     async fn test_thread_search_includes_expanded_tool_call_content(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -16415,6 +16528,99 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_terminal_restore_uses_command_card_default(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let tool_id = acp_v2::ToolCallId::new("restored-terminal-default");
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new("restored-terminal-default")
+                        .title("echo restored")
+                        .kind(acp_v2::ToolKind::Execute)
+                        .status(acp_v2::ToolCallStatus::Completed)
+                        .content(vec![acp_v2::ToolCallContent::Terminal(
+                            acp_v2::Terminal::new("restored-terminal"),
+                        )]),
+                    cx,
+                )
+            })
+            .expect("terminal tool");
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_display_terminal(
+                    "restored-terminal".into(),
+                    acp_thread::DisplayTerminalPatch {
+                        output: agent_client_protocol::schema::MaybeUndefined::Value(
+                            acp_thread::DisplayTerminalOutput {
+                                data: b"restored output".to_vec(),
+                                meta: None,
+                            },
+                        ),
+                        exit_status: agent_client_protocol::schema::MaybeUndefined::Value(
+                            acp_v2::TerminalExitStatus::new().exit_code(0),
+                        ),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            })
+            .expect("terminal snapshot");
+        let terminal = thread.read_with(cx, |thread, _| {
+            thread
+                .terminal(acp_v2::TerminalId::new("restored-terminal"))
+                .expect("terminal")
+        });
+        let (workspace, project, capabilities, agent_id) = thread_view.read_with(cx, |view, _| {
+            (
+                view.workspace.clone(),
+                view.project.clone(),
+                view.session_capabilities.clone(),
+                view.agent_id.clone(),
+            )
+        });
+        for expand in [false, true] {
+            cx.update(|_, cx| {
+                AgentSettings::override_global(
+                    AgentSettings {
+                        expand_terminal_card: expand,
+                        ..AgentSettings::get_global(cx).clone()
+                    },
+                    cx,
+                )
+            });
+            let state = cx.update(|_, cx| {
+                cx.new(|_| {
+                    EntryViewState::new(
+                        workspace.clone(),
+                        project.clone(),
+                        None,
+                        capabilities.clone(),
+                        agent_id.clone(),
+                    )
+                })
+            });
+            state.update_in(cx, |state, window, cx| {
+                state.sync_entry_initial(0, &thread, window, cx)
+            });
+            state.read_with(cx, |state, _| {
+                assert_eq!(state.is_tool_call_expanded(&tool_id), expand);
+                assert_eq!(
+                    state
+                        .entry(0)
+                        .and_then(|entry| entry.terminal(&terminal))
+                        .is_some(),
+                    expand
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
     async fn test_terminal_snapshots_reuse_the_read_only_tool_view(cx: &mut TestAppContext) {
         init_test(cx);
         let (conversation_view, cx) =
@@ -19573,6 +19779,104 @@ pub(crate) mod tests {
                     .is_none()
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_command_disclosures_preserve_choice_during_approval(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    expand_terminal_card: false,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            )
+        });
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        for (id, terminal) in [("approval-text", false), ("approval-terminal", true)] {
+            let mut call = acp_v2::ToolCallUpdate::new(id)
+                .title("echo first\necho second")
+                .kind(acp_v2::ToolKind::Execute)
+                .status(acp_v2::ToolCallStatus::InProgress);
+            if terminal {
+                call = call.content(vec![acp_v2::ToolCallContent::Terminal(
+                    acp_v2::Terminal::new("approval-terminal-view"),
+                )]);
+            } else {
+                call = call.content(vec!["text output".into()]);
+            }
+            thread
+                .update(cx, |thread, cx| thread.upsert_wire_tool_call(call, cx))
+                .expect("tool call");
+            cx.run_until_parked();
+            let tool_id = acp_v2::ToolCallId::new(id);
+            let state = thread_view.read_with(cx, |view, _| view.entry_view_state.clone());
+            state.update(cx, |state, cx| {
+                state.collapse_tool_call(&tool_id);
+                cx.notify();
+            });
+            let (disclosure, preview, full): (&'static str, &'static str, &'static str) =
+                if terminal {
+                    let terminal = thread.read_with(cx, |thread, _| {
+                        thread
+                            .terminal(acp_v2::TerminalId::new("approval-terminal-view"))
+                            .expect("terminal")
+                    });
+                    let entity_id = terminal.entity_id();
+                    (
+                        Box::leak(
+                            format!("terminal-command-disclosure-{entity_id}").into_boxed_str(),
+                        ),
+                        Box::leak(
+                            format!("command-preview-terminal-tool-header-group-{entity_id}")
+                                .into_boxed_str(),
+                        ),
+                        Box::leak(
+                            format!("command-full-terminal-tool-header-group-{entity_id}")
+                                .into_boxed_str(),
+                        ),
+                    )
+                } else {
+                    (
+                        "command-card-disclosure-0",
+                        "command-preview-inner-tool-call-header-0",
+                        "command-full-inner-tool-call-header-0",
+                    )
+                };
+            cx.run_until_parked();
+            assert!(cx.debug_bounds(disclosure).is_some());
+            assert!(cx.debug_bounds(preview).is_some());
+            assert!(cx.debug_bounds(full).is_none());
+            let request = generic_permission_prompt(
+                &thread,
+                Some(serde_json::json!({
+                    "type": "tool_call", "toolCall": {"toolCallId": id}
+                })),
+                cx,
+            );
+            let (request_id, response) = request_test_generic_permission(&thread, request, cx);
+            cx.run_until_parked();
+            assert!(cx.debug_bounds(disclosure).is_none());
+            assert!(cx.debug_bounds(preview).is_none());
+            assert!(cx.debug_bounds(full).is_some());
+            click_generic_permission(request_id, Some("once"), cx);
+            assert_eq!(
+                response.await,
+                acp_v2::RequestPermissionOutcome::Selected(acp_v2::SelectedPermissionOutcome::new(
+                    "once"
+                ))
+            );
+            cx.run_until_parked();
+            assert!(!state.read_with(cx, |state, _| state.is_tool_call_expanded(&tool_id)));
+            assert!(cx.debug_bounds(disclosure).is_some());
+            assert!(cx.debug_bounds(preview).is_some());
+            assert!(cx.debug_bounds(full).is_none());
+        }
     }
 
     #[gpui::test]

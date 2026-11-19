@@ -357,7 +357,7 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_edit_card: Option<bool>,
-    /// Whether to have terminal cards in the agent panel expanded, showing the whole command output.
+    /// Initially expand command cards in the agent panel to show the full command and output.
     ///
     /// Default: true
     pub expand_terminal_card: Option<bool>,

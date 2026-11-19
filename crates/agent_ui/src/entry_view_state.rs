@@ -65,11 +65,22 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
+    command_tool_calls: HashSet<acp_v2::ToolCallId>,
+    command_expansion_overrides: HashMap<acp_v2::ToolCallId, bool>,
+    expand_command_cards_by_default: bool,
     /// Subagent cards shown for an ACP parent's outgoing session messages.
     expanded_acp_subagent_cards: HashSet<acp_v2::SessionId>,
 }
 
 impl EntryViewState {
+    pub(crate) fn set_expand_command_cards_by_default(&mut self, expand: bool) -> bool {
+        if self.expand_command_cards_by_default == expand {
+            return false;
+        }
+        self.expand_command_cards_by_default = expand;
+        true
+    }
+
     pub fn new(
         workspace: WeakEntity<Workspace>,
         project: WeakEntity<Project>,
@@ -89,12 +100,22 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            command_tool_calls: HashSet::default(),
+            command_expansion_overrides: HashMap::default(),
+            expand_command_cards_by_default: false,
             expanded_acp_subagent_cards: HashSet::default(),
         }
     }
 
     pub(crate) fn is_tool_call_expanded(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
-        self.expanded_tool_calls.contains(tool_call_id)
+        if self.command_tool_calls.contains(tool_call_id) {
+            self.command_expansion_overrides
+                .get(tool_call_id)
+                .copied()
+                .unwrap_or(self.expand_command_cards_by_default)
+        } else {
+            self.expanded_tool_calls.contains(tool_call_id)
+        }
     }
 
     pub(crate) fn is_tool_call_content_visible(&self, tool_call: &ToolCall) -> bool {
@@ -102,15 +123,28 @@ impl EntryViewState {
     }
 
     pub(crate) fn expand_tool_call(&mut self, tool_call_id: acp_v2::ToolCallId) {
-        self.expanded_tool_calls.insert(tool_call_id);
+        if self.command_tool_calls.contains(&tool_call_id) {
+            self.command_expansion_overrides.insert(tool_call_id, true);
+        } else {
+            self.expanded_tool_calls.insert(tool_call_id);
+        }
     }
 
     pub(crate) fn collapse_tool_call(&mut self, tool_call_id: &acp_v2::ToolCallId) {
-        self.expanded_tool_calls.remove(tool_call_id);
+        if self.command_tool_calls.contains(tool_call_id) {
+            self.command_expansion_overrides
+                .insert(tool_call_id.clone(), false);
+        } else {
+            self.expanded_tool_calls.remove(tool_call_id);
+        }
     }
 
     pub(crate) fn toggle_tool_call_expansion(&mut self, tool_call_id: &acp_v2::ToolCallId) {
-        if !self.expanded_tool_calls.remove(tool_call_id) {
+        if self.command_tool_calls.contains(tool_call_id) {
+            let expanded = self.is_tool_call_expanded(tool_call_id);
+            self.command_expansion_overrides
+                .insert(tool_call_id.clone(), !expanded);
+        } else if !self.expanded_tool_calls.remove(tool_call_id) {
             self.expanded_tool_calls.insert(tool_call_id.clone());
         }
     }
@@ -381,6 +415,13 @@ impl EntryViewState {
             }
             AgentThreadEntry::ToolCall(tool_call) => {
                 let id = tool_call.id.clone();
+                if matches!(tool_call.kind(), acp_v2::ToolKind::Execute)
+                    || tool_call.terminals().next().is_some()
+                {
+                    self.command_tool_calls.insert(id.clone());
+                    self.expand_command_cards_by_default =
+                        AgentSettings::get_global(cx).expand_terminal_card;
+                }
                 let materialize_content =
                     materialize_tool_calls || self.is_tool_call_content_visible(tool_call);
                 let terminals = tool_call.terminals().cloned().collect::<Vec<_>>();
@@ -443,13 +484,7 @@ impl EntryViewState {
                                     cx,
                                 )
                                 .into_any();
-                                let was_restored = restored_view_ids.remove(&terminal_id);
-                                if emit_new_view_events && !was_restored {
-                                    cx.emit(EntryViewEvent {
-                                        entry_index: index,
-                                        view_event: ViewEvent::NewTerminal(id.clone()),
-                                    });
-                                }
+                                restored_view_ids.remove(&terminal_id);
                                 entry.insert(element);
                             }
                             collections::hash_map::Entry::Occupied(_entry) => {
@@ -672,7 +707,6 @@ pub struct EntryViewEvent {
 
 pub enum ViewEvent {
     NewDiff(acp_v2::ToolCallId),
-    NewTerminal(acp_v2::ToolCallId),
     TerminalMovedToBackground(acp_v2::ToolCallId),
     MessageEditorEvent(Entity<MessageEditor>, MessageEditorEvent),
     OpenDiffLocation {

@@ -435,6 +435,13 @@ fn parse_cat_numbered_code(code: &str) -> Option<ParsedCatNumberedCode> {
     })
 }
 
+fn command_preview_text(command: &str) -> String {
+    match command.split_once('\n') {
+        Some((first, _)) => format!("{}…", strip_line_ending(first)),
+        None => command.to_string(),
+    }
+}
+
 fn strip_line_ending(line: &str) -> &str {
     let without_lf = line.strip_suffix('\n').unwrap_or(line);
     without_lf.strip_suffix('\r').unwrap_or(without_lf)
@@ -1097,6 +1104,44 @@ impl ThreadView {
             cx.notify();
         }));
         subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe_global_in::<settings::SettingsStore>(
+            window,
+            |this, window, cx| {
+                let expand = AgentSettings::get_global(cx).expand_terminal_card;
+                let changed = this.entry_view_state.update(cx, |state, _| {
+                    state.set_expand_command_cards_by_default(expand)
+                });
+                if changed {
+                    let indices: Vec<_> = this
+                        .thread
+                        .read(cx)
+                        .entries()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, entry)| {
+                            let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                                return None;
+                            };
+                            let is_command = matches!(tool_call.kind(), acp_v2::ToolKind::Execute)
+                                || tool_call.terminals().next().is_some();
+                            (is_command
+                                && this
+                                    .entry_view_state
+                                    .read(cx)
+                                    .is_tool_call_expanded(&tool_call.id))
+                            .then_some(index)
+                        })
+                        .collect();
+                    if expand {
+                        for index in indices {
+                            this.materialize_tool_call_views(index, window, cx);
+                        }
+                    }
+                    this.refresh_thread_search(window, cx);
+                    cx.notify();
+                }
+            },
+        ));
         let thread_read_only = thread.read(cx).interactivity().is_read_only();
         if let Some(config_options_view) = &config_options_view {
             config_options_view.update(cx, |view, cx| view.set_read_only(thread_read_only, cx));
@@ -1706,13 +1751,6 @@ impl ThreadView {
         match &event.view_event {
             ViewEvent::NewDiff(tool_call_id) => {
                 if AgentSettings::get_global(cx).expand_edit_card {
-                    self.entry_view_state.update(cx, |state, _cx| {
-                        state.expand_tool_call(tool_call_id.clone());
-                    });
-                }
-            }
-            ViewEvent::NewTerminal(tool_call_id) => {
-                if AgentSettings::get_global(cx).expand_terminal_card {
                     self.entry_view_state.update(cx, |state, _cx| {
                         state.expand_tool_call(tool_call_id.clone());
                     });
@@ -9399,6 +9437,7 @@ impl ThreadView {
         &self,
         group: SharedString,
         is_preview: bool,
+        collapsed: bool,
         command: Entity<Markdown>,
         window: &Window,
         cx: &Context<Self>,
@@ -9411,6 +9450,22 @@ impl ThreadView {
             .and_then(|s| s.strip_suffix("\n```"))
             .unwrap_or(&command_source)
             .to_string();
+
+        if collapsed {
+            let first_line = command_preview_text(&command_text);
+            let selector = format!("command-preview-{group}");
+            return div()
+                .debug_selector(move || selector.clone())
+                .min_w_0()
+                .overflow_hidden()
+                .px_1p5()
+                .child(
+                    Label::new(first_line)
+                        .buffer_font(cx)
+                        .size(LabelSize::Small)
+                        .truncate(),
+                );
+        }
 
         let mut style =
             MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx);
@@ -9452,7 +9507,9 @@ impl ThreadView {
             .tooltip_label("Copy Command")
             .visible_on_hover(group.clone());
 
+        let selector = format!("command-full-{group}");
         v_flex()
+            .debug_selector(move || selector.clone())
             .group(group)
             .relative()
             .p_1p5()
@@ -9487,7 +9544,9 @@ impl ThreadView {
             .and_then(|id| self.thread.read(cx).permission_request(id));
         let generic_permissions =
             self.render_generic_tool_permissions(active_session_id, tool_call, cx);
-        let needs_confirmation = permission_request.is_some() || generic_permissions.is_some();
+        let needs_confirmation = permission_request.is_some()
+            || generic_permissions.is_some()
+            || matches!(tool_call.status(), ToolCallStatus::WaitingForConfirmation);
 
         let output = terminal_data.output();
         let command_finished = output.is_some()
@@ -9525,18 +9584,18 @@ impl ThreadView {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "current directory".to_string());
 
-        let command_element = self.render_collapsible_command(
-            header_group.clone(),
-            false,
-            tool_call.label.clone(),
-            window,
-            cx,
-        );
-
         let is_expanded = self
             .entry_view_state
             .read(cx)
             .is_tool_call_expanded(&tool_call.id);
+        let command_element = self.render_collapsible_command(
+            header_group.clone(),
+            false,
+            !is_expanded && !needs_confirmation,
+            tool_call.label.clone(),
+            window,
+            cx,
+        );
 
         let truncated_tooltip = truncated_output.then(|| {
             if let Some(output) = output {
@@ -9567,17 +9626,20 @@ impl ThreadView {
         )
         .elapsed(time_elapsed)
         .running(!command_finished && !needs_confirmation)
-        .on_toggle_expand(cx.listener({
-            let id = tool_call.id.clone();
-            move |this, _event, window, cx| {
-                this.entry_view_state.update(cx, |state, _cx| {
-                    state.toggle_tool_call_expansion(&id);
-                });
-                this.materialize_tool_call_views(entry_ix, window, cx);
-                this.refresh_thread_search(window, cx);
-                cx.notify();
-            }
-        }))
+        .completed(command_finished)
+        .when(!needs_confirmation, |header| {
+            header.on_toggle_expand(cx.listener({
+                let id = tool_call.id.clone();
+                move |this, _event, window, cx| {
+                    this.entry_view_state.update(cx, |state, _cx| {
+                        state.toggle_tool_call_expansion(&id);
+                    });
+                    this.materialize_tool_call_views(entry_ix, window, cx);
+                    this.refresh_thread_search(window, cx);
+                    cx.notify();
+                }
+            }))
+        })
         .when(terminal_data.is_process_backed(), |header| {
             header.on_stop({
                 let terminal = terminal.clone();
@@ -9600,7 +9662,8 @@ impl ThreadView {
         .when_some(tool_call.sandbox_not_applied.as_ref(), |header, reason| {
             header.sandbox_warning(self.sandbox_not_applied_warning(reason, cx))
         })
-        .command_slot(command_element);
+        .command_slot(command_element)
+        .show_command_in_row(!is_expanded && !needs_confirmation);
 
         let terminal_view = self
             .entry_view_state
@@ -9884,7 +9947,7 @@ impl ThreadView {
             .entry_view_state
             .read(cx)
             .is_tool_call_content_visible(tool_call)
-            || generic_permissions.is_some();
+            || needs_confirmation;
 
         let input_output_header = |label: SharedString| {
             Label::new(label)
@@ -10120,16 +10183,85 @@ impl ThreadView {
             None
         };
 
+        let command_header = || {
+            let command = self.render_collapsible_command(
+                card_header_id.clone(),
+                true,
+                !is_open && !needs_confirmation,
+                tool_call.label.clone(),
+                window,
+                cx,
+            );
+            let disclosure = (!needs_confirmation).then(|| {
+                let icon = if is_open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                };
+                let button = IconButton::new(("expand-output", entry_ix), icon)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tab_index(0isize)
+                    .aria_label(if is_open {
+                        "Collapse command"
+                    } else {
+                        "Expand command"
+                    })
+                    .aria_expanded(is_open)
+                    .on_click(cx.listener({
+                        let id = tool_call.id.clone();
+                        move |this, _, window, cx| {
+                            this.entry_view_state
+                                .update(cx, |state, _| state.toggle_tool_call_expansion(&id));
+                            this.materialize_tool_call_views(entry_ix, window, cx);
+                            this.refresh_thread_search(window, cx);
+                            cx.notify();
+                        }
+                    }));
+                div()
+                    .debug_selector(move || format!("command-card-disclosure-{entry_ix}"))
+                    .child(button)
+            });
+            h_flex()
+                .w_full()
+                .items_center()
+                .child(div().flex_1().min_w_0().child(command))
+                .children(disclosure)
+                .when(failed_or_canceled, |row| {
+                    row.child(
+                        Icon::new(IconName::Close)
+                            .color(Color::Error)
+                            .size(IconSize::Small),
+                    )
+                })
+                .when(
+                    matches!(
+                        tool_call.status(),
+                        ToolCallStatus::InProgress | ToolCallStatus::Pending
+                    ),
+                    |row| {
+                        row.child(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                    },
+                )
+                .when(
+                    matches!(tool_call.status(), ToolCallStatus::Completed),
+                    |row| {
+                        row.child(
+                            Icon::new(IconName::Check)
+                                .size(IconSize::Small)
+                                .color(Color::Success),
+                        )
+                    },
+                )
+        };
         let body = v_flex()
             .map(|this| {
                 if is_terminal_tool {
-                    this.child(self.render_collapsible_command(
-                        card_header_id.clone(),
-                        true,
-                        tool_call.label.clone(),
-                        window,
-                        cx,
-                    ))
+                    this.child(command_header())
                 } else {
                     this.child(
                         h_flex()
@@ -14716,6 +14848,20 @@ mod tests {
     use std::sync::Once;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_command_preview_marks_omitted_lines() {
+        assert_eq!(
+            command_preview_text("echo short\necho second"),
+            "echo short…"
+        );
+        assert_eq!(
+            command_preview_text("echo short\r\necho second"),
+            "echo short…"
+        );
+        let long = "x".repeat(500);
+        assert_eq!(command_preview_text(&long), long);
+    }
 
     #[test]
     fn test_reported_activity_completion_status() {

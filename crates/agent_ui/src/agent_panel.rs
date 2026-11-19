@@ -5689,6 +5689,7 @@ impl AgentPanel {
             .is_some();
 
         let workspace = self.workspace.clone();
+        let fs = self.fs.clone();
 
         PopoverMenu::new("agent-options-menu")
             .trigger_with_tooltip(
@@ -5832,6 +5833,24 @@ impl AgentPanel {
                                 .action("Profiles", Box::new(ManageProfiles::default()));
                         }
 
+                        let expand_commands = AgentSettings::get_global(cx).expand_terminal_card;
+                        menu = menu.toggleable_entry(
+                            "Expand Command Cards by Default",
+                            expand_commands,
+                            IconPosition::Start,
+                            None,
+                            {
+                                let fs = fs.clone();
+                                move |_, cx| {
+                                    update_settings_file(fs.clone(), cx, move |settings, _| {
+                                        settings
+                                            .agent
+                                            .get_or_insert_default()
+                                            .expand_terminal_card = Some(!expand_commands);
+                                    });
+                                }
+                            },
+                        );
                         menu = menu
                             .action("Settings", Box::new(OpenSettings))
                             .separator()

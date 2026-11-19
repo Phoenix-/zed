@@ -1383,7 +1383,7 @@
     //
     // Default: true
     "expand_edit_card": true,
-    // Whether to have terminal cards in the agent panel expanded, showing the whole command output.
+    // Initially expand command cards in the agent panel to show the full command and output.
     //
     // Default: true
     "expand_terminal_card": true,
