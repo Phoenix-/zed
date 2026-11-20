@@ -12,6 +12,8 @@ use release_channel::{AppCommitSha, ReleaseChannel};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use settings::{RegisterSetting, Settings, SettingsStore};
+#[cfg(target_os = "windows")]
+use sha2::{Digest, Sha256};
 use smol::fs::File;
 use smol::{
     fs,
@@ -264,6 +266,183 @@ struct GlobalAutoUpdate(Option<Entity<AutoUpdater>>);
 
 impl Global for GlobalAutoUpdate {}
 
+#[cfg(target_os = "windows")]
+fn fork_installed() -> bool {
+    cfg!(not(debug_assertions))
+        && cfg!(target_arch = "x86_64")
+        && option_env!("GORYNYCH_BUILD_ID").is_some()
+        && std::env::current_exe()
+            .ok()
+            .and_then(|path| {
+                path.parent()
+                    .map(|parent| parent.join("gorynych-installed"))
+            })
+            .is_some_and(|path| path.is_file())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn fork_installed() -> bool {
+    false
+}
+
+fn updates_enabled(channel: Option<ReleaseChannel>) -> bool {
+    #[cfg(target_os = "windows")]
+    if option_env!("GORYNYCH_BUILD_ID").is_some() {
+        return fork_installed();
+    }
+    fork_installed() || channel.is_some_and(|channel| channel.poll_for_updates())
+}
+
+#[cfg(target_os = "windows")]
+fn fork_id(id: &str) -> Option<(u64, u64)> {
+    let (run, attempt) = id.split_once('-')?;
+    if run.is_empty()
+        || attempt.is_empty()
+        || !run
+            .bytes()
+            .chain(attempt.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((run.parse().ok()?, attempt.parse().ok()?))
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Deserialize)]
+struct ForkRelease {
+    id: u64,
+    tag_name: String,
+    prerelease: bool,
+    draft: bool,
+    assets: Vec<ForkAsset>,
+}
+#[cfg(target_os = "windows")]
+#[derive(Deserialize)]
+struct ForkAsset {
+    name: String,
+    browser_download_url: String,
+    digest: Option<String>,
+    state: String,
+}
+
+#[cfg(target_os = "windows")]
+fn select_fork_asset(release: ForkRelease) -> Result<(String, String, String)> {
+    anyhow::ensure!(
+        release.tag_name == "nightly" && release.prerelease && !release.draft,
+        "Invalid nightly release"
+    );
+    let mut candidates = Vec::new();
+    for asset in release.assets {
+        let Some(id) = asset
+            .name
+            .strip_prefix("zed-gorynych-setup-")
+            .and_then(|name| name.strip_suffix(".exe"))
+        else {
+            continue;
+        };
+        let Some((run, attempt)) = fork_id(id) else {
+            continue;
+        };
+        let Some(digest) = asset
+            .digest
+            .as_deref()
+            .and_then(|value| value.strip_prefix("sha256:"))
+        else {
+            continue;
+        };
+        if asset.state != "uploaded"
+            || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        if asset.browser_download_url
+            != format!(
+                "https://github.com/Phoenix-/zed/releases/download/nightly/{}",
+                asset.name
+            )
+        {
+            continue;
+        }
+        candidates.push((
+            (run, attempt),
+            id.to_owned(),
+            asset.browser_download_url.clone(),
+            digest.to_ascii_lowercase(),
+        ));
+    }
+    candidates.sort_by_key(|candidate| candidate.0);
+    let (_, id, url, digest) = candidates
+        .pop()
+        .context("No complete nightly installer with SHA-256 digest")?;
+    Ok((id, url, digest))
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod fork_release_tests {
+    use super::*;
+
+    fn asset(id: &str, digest: Option<&str>) -> ForkAsset {
+        let name = format!("zed-gorynych-setup-{id}.exe");
+        ForkAsset {
+            browser_download_url: format!(
+                "https://github.com/Phoenix-/zed/releases/download/nightly/{name}"
+            ),
+            name,
+            digest: digest.map(str::to_owned),
+            state: "uploaded".into(),
+        }
+    }
+
+    #[test]
+    fn selects_newest_complete_asset_and_rejects_untrusted_metadata() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let release = ForkRelease {
+            id: 1,
+            tag_name: "nightly".into(),
+            prerelease: true,
+            draft: false,
+            assets: vec![
+                asset("9-1", Some(&digest)),
+                asset("10-1", Some(&digest)),
+                asset("11-1", None),
+            ],
+        };
+        assert_eq!(select_fork_asset(release).unwrap().0, "10-1");
+        let mut foreign = asset("12-1", Some(&digest));
+        foreign.browser_download_url = "https://example.com/file.exe".into();
+        assert!(
+            select_fork_asset(ForkRelease {
+                id: 1,
+                tag_name: "nightly".into(),
+                prerelease: true,
+                draft: false,
+                assets: vec![foreign]
+            })
+            .is_err()
+        );
+        assert!(
+            select_fork_asset(ForkRelease {
+                id: 1,
+                tag_name: "nightly".into(),
+                prerelease: false,
+                draft: false,
+                assets: vec![]
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn compares_run_and_attempt_numerically() {
+        assert!(fork_id("10-1") > fork_id("9-9"));
+        assert!(fork_id("10-2") > fork_id("10-1"));
+        assert_eq!(fork_id("10-1"), fork_id("10-1"));
+        assert_eq!(fork_id("10-bad"), None);
+    }
+}
+
 pub fn init(client: Arc<Client>, cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|_, action, window, cx| check(action, window, cx));
@@ -278,9 +457,7 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
     let auto_updater = cx.new(|cx| {
         let updater = AutoUpdater::new(version, client, cx);
 
-        let poll_for_updates = ReleaseChannel::try_global(cx)
-            .map(|channel| channel.poll_for_updates())
-            .unwrap_or(false);
+        let poll_for_updates = updates_enabled(ReleaseChannel::try_global(cx));
 
         if option_env!("ZED_UPDATE_EXPLANATION").is_none()
             && env::var("ZED_UPDATE_EXPLANATION").is_err()
@@ -322,10 +499,8 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
         return;
     }
 
-    if !ReleaseChannel::try_global(cx)
-        .map(|channel| channel.poll_for_updates())
-        .unwrap_or(false)
-    {
+    if !updates_enabled(ReleaseChannel::try_global(cx)) {
+        drop(window.prompt(gpui::PromptLevel::Info, "Could not check for updates", Some("Automatic updates require an installed build. Portable and development builds must be updated manually."), &["OK"], cx));
         return;
     }
 
@@ -343,6 +518,9 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
 }
 
 pub fn release_notes_url(cx: &mut App) -> Option<String> {
+    if fork_installed() {
+        return Some("https://github.com/Phoenix-/zed/releases/tag/nightly".to_string());
+    }
     let release_channel = ReleaseChannel::try_global(cx)?;
     let url = match release_channel {
         ReleaseChannel::Stable | ReleaseChannel::Preview => {
@@ -756,17 +934,95 @@ impl AutoUpdater {
             cx.notify();
         });
 
+        #[cfg(target_os = "windows")]
+        let fork_release = if fork_installed() {
+            let mut response = client
+                .get(
+                    "https://api.github.com/repos/Phoenix-/zed/releases/tags/nightly",
+                    Default::default(),
+                    true,
+                )
+                .await?;
+            anyhow::ensure!(
+                response.status().is_success(),
+                "GitHub release request failed: {}",
+                response.status()
+            );
+            let mut body = Vec::new();
+            response.body_mut().read_to_end(&mut body).await?;
+            let mut release: ForkRelease = serde_json::from_slice(&body)?;
+            anyhow::ensure!(
+                release.tag_name == "nightly" && release.prerelease && !release.draft,
+                "Invalid nightly release"
+            );
+            release.assets.clear();
+            for page in 1..=11 {
+                let url = format!(
+                    "https://api.github.com/repos/Phoenix-/zed/releases/{}/assets?per_page=100&page={page}",
+                    release.id
+                );
+                let mut response = client.get(&url, Default::default(), true).await?;
+                anyhow::ensure!(
+                    response.status().is_success(),
+                    "GitHub assets request failed: {}",
+                    response.status()
+                );
+                let mut body = Vec::new();
+                response.body_mut().read_to_end(&mut body).await?;
+                let assets: Vec<ForkAsset> = serde_json::from_slice(&body)?;
+                let done = assets.len() < 100;
+                release.assets.extend(assets);
+                if done {
+                    break;
+                }
+                anyhow::ensure!(page < 11, "Too many release assets");
+            }
+            Some(select_fork_asset(release)?)
+        } else {
+            None
+        };
+        #[cfg(target_os = "windows")]
+        let fetched_release_data = if let Some((id, url, _)) = &fork_release {
+            let mut version = installed_version.clone();
+            version.build = semver::BuildMetadata::new(&id.replace('-', "."))?;
+            ReleaseAsset {
+                version: version.to_string(),
+                url: url.clone(),
+            }
+        } else {
+            Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?
+        };
+        #[cfg(not(target_os = "windows"))]
         let fetched_release_data =
             Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?;
         let fetched_version = fetched_release_data.clone().version;
         let app_commit_sha = Ok(cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full())));
-        let newer_version = Self::check_if_fetched_version_is_newer(
-            release_channel,
-            app_commit_sha,
-            installed_version,
-            fetched_version,
-            previous_status.clone(),
-        )?;
+        #[cfg(target_os = "windows")]
+        let fork_newer = fork_release.as_ref().map(|(id, _, _)| {
+            let pending = match &previous_status {
+                AutoUpdateStatus::Updated { version } => {
+                    Some(version.build.as_str().replace('.', "-"))
+                }
+                _ => None,
+            };
+            let current = pending.as_deref().or(option_env!("GORYNYCH_BUILD_ID"));
+            fork_id(id) > current.and_then(fork_id)
+        });
+        #[cfg(not(target_os = "windows"))]
+        let fork_newer: Option<bool> = None;
+        let newer_version = if let Some(newer) = fork_newer {
+            newer
+                .then(|| fetched_version.parse::<Version>())
+                .transpose()?
+        } else {
+            Self::check_if_fetched_version_is_newer(
+                release_channel,
+                app_commit_sha,
+                installed_version,
+                fetched_version,
+                previous_status.clone(),
+            )?
+        };
 
         let Some(newer_version) = newer_version else {
             this.update(cx, |this, cx| {
@@ -817,6 +1073,15 @@ impl AutoUpdater {
         )
         .await
         .with_context(|| format!("Failed to download update to {}", target_path.display()))?;
+
+        #[cfg(target_os = "windows")]
+        if let Some((_, _, expected)) = &fork_release {
+            let bytes = smol::fs::read(&target_path).await?;
+            anyhow::ensure!(
+                format!("{:x}", Sha256::digest(&bytes)) == *expected,
+                "Downloaded installer SHA-256 mismatch"
+            );
+        }
 
         this.update(cx, |this, cx| {
             this.status = AutoUpdateStatus::Installing {
@@ -1315,12 +1580,53 @@ async fn install_release_windows(downloaded_installer: &Path) -> Result<Option<P
     cmd.arg("/verysilent")
         .arg("/update=true")
         .arg("/MERGETASKS=!desktopicon");
+    if fork_installed() {
+        let app_dir = std::env::current_exe()?
+            .parent()
+            .context("No parent dir for Zed.exe")?
+            .to_path_buf();
+        cmd.arg(format!("/DIR={}", app_dir.display()));
+    }
     let output = cmd.output().await?;
-    anyhow::ensure!(
-        output.status.success(),
-        "failed to start installer: {:?}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if fork_installed() {
+        let flag = std::env::current_exe()?
+            .parent()
+            .context("No parent dir for Zed.exe")?
+            .join("updates")
+            .join("versions.txt");
+        let staged = async {
+            anyhow::ensure!(
+                output.status.success(),
+                "installer failed: {:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let version = smol::fs::read_to_string(&flag)
+                .await
+                .with_context(|| format!("Update completion flag missing: {}", flag.display()))?;
+            anyhow::ensure!(
+                !version.trim().is_empty(),
+                "Update completion flag is empty"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if staged.is_err() {
+            match smol::fs::remove_file(&flag).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).context("Failed to remove invalid update completion flag");
+                }
+            }
+        }
+        staged?;
+    } else {
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to start installer: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     // We return the path to the update helper program, because it will
     // perform the final steps of the update process, copying the new binary,
     // deleting the old one, and launching the new binary.

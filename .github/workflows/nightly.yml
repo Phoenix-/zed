@@ -29,8 +29,8 @@ jobs:
       CARGO_HOME: C:\gorynych-ci\cargo
       RUSTUP_HOME: C:\gorynych-ci\rustup
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-      # The dev channel never updates itself to stock Zed, and it keeps its own
-      # database and single-instance lock beside an installed stable Zed.
+      # Keep the Dev database and single-instance lock beside stock Zed.
+      # Installed fork builds discover only this repository's nightly assets.
       ZED_RELEASE_CHANNEL: dev
       ASSET: zed-gorynych-windows-x64.zip
     defaults:
@@ -57,10 +57,15 @@ jobs:
           & (Join-Path $cargoBin 'rustup.exe') toolchain install
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
+      - name: Set build identity
+        run: |
+          $id = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "GORYNYCH_BUILD_ID=$id`n")
+
       - name: Build
         run: |
           $ErrorActionPreference = 'Continue'
-          cargo build --profile release-fast -p zed -p cli
+          cargo build --profile release-fast -p zed -p cli -p auto_update_helper
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           # The server for remote projects on Windows machines, built on its own
           # like upstream does, so that the app's features don't leak into it.
@@ -73,7 +78,7 @@ jobs:
           $out = Join-Path $env:CARGO_TARGET_DIR 'release-fast'
           $stage = Join-Path $env:RUNNER_TEMP 'zed-gorynych'
           if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
-          New-Item -ItemType Directory -Path (Join-Path $stage 'x64'), (Join-Path $stage 'bin'), (Join-Path $stage 'remote-server') | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $stage 'x64'), (Join-Path $stage 'bin'), (Join-Path $stage 'remote-server'), (Join-Path $stage 'tools') | Out-Null
           # zed.exe runs its terminals through the conpty.dll that its build
           # downloads next to it; conpty.dll starts OpenConsole.exe.
           Copy-Item (Join-Path $out 'zed.exe'), (Join-Path $out 'conpty.dll'), (Join-Path $out 'OpenConsole.exe') $stage
@@ -81,13 +86,27 @@ jobs:
           # The CLI, where installed builds keep it: zed.exe uses it to answer
           # git and ssh password prompts, and it's the `zed` command.
           Copy-Item (Join-Path $out 'cli.exe') (Join-Path $stage 'bin\zed.exe')
+          Copy-Item 'crates\zed\resources\windows\zed.sh' (Join-Path $stage 'bin\zed')
+          Copy-Item (Join-Path $out 'auto_update_helper.exe') (Join-Path $stage 'tools')
           # The server zed.exe uploads to Windows machines it opens remote
           # projects on, packed like upstream's: a zip with remote_server.exe.
           Compress-Archive -Path (Join-Path $out 'remote_server.exe') -DestinationPath (Join-Path $stage 'remote-server\zed-remote-server-windows-x86_64.zip')
+          & .\script\validate-gorynych-package.ps1 -Stage $stage -RemoteServer (Join-Path $out 'remote_server.exe')
           $zip = Join-Path $env:RUNNER_TEMP $env:ASSET
           if (Test-Path $zip) { Remove-Item -Force $zip }
           $ErrorActionPreference = 'Continue'
           tar.exe -a -c -f $zip -C $env:RUNNER_TEMP zed-gorynych
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build installer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'zed-gorynych'
+          [IO.File]::WriteAllText((Join-Path $stage 'gorynych-installed'), 'installed')
+          $version = (Select-String -Path crates\zed\Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $iscc = & .\script\prepare-gorynych-inno.ps1 -RunnerTemp $env:RUNNER_TEMP
+          $name = "zed-gorynych-setup-$env:GORYNYCH_BUILD_ID"
+          & $iscc "/DVersion=$version" "/DStage=$stage" "/DOutputDir=$env:RUNNER_TEMP" "/DOutputName=$name" 'crates\zed\resources\windows\gorynych.iss'
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Publish the nightly prerelease
@@ -102,7 +121,7 @@ jobs:
           $lines = @(
             "Zed $version with the Gorynych patches, dev channel, built from $sha.",
             "",
-            "Unzip and run ``zed-gorynych\zed.exe``. It doesn't update itself.",
+            "Install the setup executable for automatic updates. Portable ZIP builds require manual updates. Close portable Zed and install once to migrate; the Dev profile is shared.",
             "",
             "Remote projects over ssh on Windows x64 machines get the server in ``zed-gorynych\remote-server`` on first connect.",
             "",
@@ -125,5 +144,27 @@ jobs:
           }
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
+          # Retain recent immutable installers for clients already downloading.
+          # GitHub limits a release to 1000 assets, so prune only fork installers
+          # older than 30 days and keep at least 50, before uploading.
+          $releaseId = gh api "repos/$repo/releases/tags/nightly" --jq .id
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $rows = @(gh api --paginate "repos/$repo/releases/$releaseId/assets?per_page=100" --jq '.[] | [.id, .name, .created_at] | @tsv')
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $installers = @($rows | ForEach-Object {
+            $fields = $_ -split "`t"
+            if ($fields.Count -eq 3 -and $fields[1] -match '^zed-gorynych-setup-[0-9]+-[0-9]+\.exe$') {
+              [pscustomobject]@{ Id = $fields[0]; Created = [DateTimeOffset]::Parse($fields[2]) }
+            }
+          } | Sort-Object Created -Descending)
+          $cutoff = [DateTimeOffset]::UtcNow.AddDays(-30)
+          foreach ($old in @($installers | Select-Object -Skip 50 | Where-Object { $_.Created -lt $cutoff })) {
+            gh api -X DELETE "repos/$repo/releases/assets/$($old.Id)" --silent
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+
           gh release upload nightly (Join-Path $env:RUNNER_TEMP $env:ASSET) --repo $repo --clobber
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # Preserve unique installer assets for in-flight downloads.
+          gh release upload nightly (Join-Path $env:RUNNER_TEMP "zed-gorynych-setup-$env:GORYNYCH_BUILD_ID.exe") --repo $repo
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

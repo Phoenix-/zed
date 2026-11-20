@@ -2,7 +2,10 @@ use std::{
     ffi::{OsStr, OsString},
     os::windows::ffi::OsStrExt,
     path::Path,
-    sync::LazyLock,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -27,6 +30,20 @@ pub(crate) struct Job {
 }
 
 impl Job {
+    pub fn move_fork_if_exists(
+        filename: &'static Path,
+        new_filename: &'static Path,
+        is_fork: bool,
+    ) -> Self {
+        if is_fork {
+            Self::move_if_exists(filename, new_filename)
+        } else {
+            Job {
+                apply: Box::new(|_| Ok(())),
+                rollback: Box::new(|_| Ok(())),
+            }
+        }
+    }
     pub fn mkdir(name: &'static Path) -> Self {
         Job {
             apply: Box::new(move |app_dir| {
@@ -43,21 +60,24 @@ impl Job {
     }
 
     pub fn mkdir_if_exists(name: &'static Path, check: &'static Path) -> Self {
+        let created = Arc::new(AtomicBool::new(false));
+        let created_on_apply = created.clone();
         Job {
             apply: Box::new(move |app_dir| {
                 let dir = app_dir.join(name);
                 let check = app_dir.join(check);
 
-                if check.exists() {
+                if check.exists() && !dir.exists() {
                     std::fs::create_dir_all(&dir)
-                        .context(format!("Failed to create directory {}", dir.display()))?
+                        .context(format!("Failed to create directory {}", dir.display()))?;
+                    created_on_apply.store(true, Ordering::Relaxed);
                 }
                 Ok(())
             }),
             rollback: Box::new(move |app_dir| {
                 let dir = app_dir.join(name);
 
-                if dir.exists() {
+                if created.swap(false, Ordering::Relaxed) && dir.exists() {
                     std::fs::remove_dir_all(&dir)
                         .context(format!("Failed to remove directory {}", dir.display()))?
                 }
@@ -164,7 +184,10 @@ impl Job {
 }
 
 #[cfg(not(test))]
-pub(crate) static JOBS: LazyLock<[Job; 22]> = LazyLock::new(|| {
+pub(crate) static JOBS: LazyLock<[Job; 26]> =
+    LazyLock::new(|| production_jobs(option_env!("GORYNYCH_BUILD_ID").is_some()));
+
+fn production_jobs(is_fork: bool) -> [Job; 26] {
     fn p(value: &str) -> &Path {
         Path::new(value)
     }
@@ -188,6 +211,8 @@ pub(crate) static JOBS: LazyLock<[Job; 22]> = LazyLock::new(|| {
         ),
         //
         Job::move_file(p("conpty.dll"), p("old\\conpty.dll")),
+        Job::move_fork_if_exists(p("remote-server"), p("old\\remote-server"), is_fork),
+        Job::move_fork_if_exists(p("amd_ags_x64.dll"), p("old\\amd_ags_x64.dll"), is_fork),
         // Copy new files
         Job::move_file(p("install\\Zed.exe"), p("Zed.exe")),
         Job::move_file(p("install\\bin\\Zed.exe"), p("bin\\Zed.exe")),
@@ -205,13 +230,15 @@ pub(crate) static JOBS: LazyLock<[Job; 22]> = LazyLock::new(|| {
         ),
         //
         Job::move_file(p("install\\conpty.dll"), p("conpty.dll")),
+        Job::move_fork_if_exists(p("install\\remote-server"), p("remote-server"), is_fork),
+        Job::move_fork_if_exists(p("install\\amd_ags_x64.dll"), p("amd_ags_x64.dll"), is_fork),
         // Cleanup installer and updates folder
         Job::rmdir_nofail(p("updates")),
         Job::rmdir_nofail(p("install")),
         // Cleanup old installation
         Job::rmdir_nofail(p("old")),
     ]
-});
+}
 
 #[cfg(test)]
 pub(crate) static JOBS: LazyLock<[Job; 9]> = LazyLock::new(|| {
@@ -452,7 +479,73 @@ pub(crate) fn perform_update(
 mod test {
     use std::{ffi::OsString, path::Path};
 
-    use super::{perform_update, zed_launch_command};
+    use super::{perform_update, production_jobs, zed_launch_command};
+
+    fn staged_installation() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for (path, contents) in [
+            ("Zed.exe", "old editor"),
+            ("bin/Zed.exe", "old cli"),
+            ("bin/zed", "old script"),
+            ("conpty.dll", "old dll"),
+            ("x64/OpenConsole.exe", "old console"),
+            ("remote-server/server.zip", "old server"),
+            ("install/Zed.exe", "new editor"),
+            ("install/bin/Zed.exe", "new cli"),
+            ("install/bin/zed", "new script"),
+            ("install/conpty.dll", "new dll"),
+            ("install/x64/OpenConsole.exe", "new console"),
+            ("install/remote-server/server.zip", "new server"),
+        ] {
+            let file = root.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, contents).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn production_jobs_move_and_rollback_bundled_server() {
+        let root = staged_installation();
+        let jobs = production_jobs(true);
+        // Stop before irreversible cleanup, as on a failure after the staged files move.
+        for job in &jobs[..23] {
+            (job.apply)(root.path()).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("remote-server/server.zip")).unwrap(),
+            "new server"
+        );
+        for job in jobs[..23].iter().rev() {
+            (job.rollback)(root.path()).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("remote-server/server.zip")).unwrap(),
+            "old server"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("install/remote-server/server.zip")).unwrap(),
+            "new server"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("x64/OpenConsole.exe")).unwrap(),
+            "old console"
+        );
+    }
+
+    #[test]
+    fn production_jobs_commit_bundled_server() {
+        let root = staged_installation();
+        for job in production_jobs(true) {
+            (job.apply)(root.path()).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("remote-server/server.zip")).unwrap(),
+            "new server"
+        );
+        assert!(!root.path().join("install").exists());
+        assert!(!root.path().join("old").exists());
+    }
 
     #[test]
     fn test_zed_launch_command_preserves_arguments() {

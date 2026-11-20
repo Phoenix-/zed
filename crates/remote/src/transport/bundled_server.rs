@@ -47,10 +47,14 @@ impl BundledServer {
         let is_file = smol::fs::metadata(&archive)
             .await
             .is_ok_and(|metadata| metadata.is_file());
+        let build_suffix = option_env!("GORYNYCH_BUILD_ID")
+            .filter(|id| id.bytes().all(|byte| byte.is_ascii_digit() || byte == b'-'))
+            .map(|id| format!("-{id}"))
+            .unwrap_or_default();
         is_file.then(|| Self {
             archive,
             binary_name: format!(
-                "zed-remote-server-dev-{commit}{}",
+                "zed-remote-server-dev-{commit}{build_suffix}{}",
                 if is_windows { ".exe" } else { "" }
             ),
         })
@@ -74,6 +78,12 @@ mod tests {
 
     #[test]
     fn test_finds_the_server_for_the_remote_platform() {
+        let expected_suffix = match option_env!("GORYNYCH_BUILD_ID") {
+            Some(id) if id.bytes().all(|byte| byte.is_ascii_digit() || byte == b'-') => {
+                format!("-{id}")
+            }
+            _ => String::new(),
+        };
         let exe_dir = tempfile::tempdir().unwrap();
         let bundle_dir = exe_dir.path().join(BUNDLE_DIR);
         std::fs::create_dir(&bundle_dir).unwrap();
@@ -97,7 +107,7 @@ mod tests {
             found,
             BundledServer {
                 archive: bundle_dir.join("zed-remote-server-windows-x86_64.zip"),
-                binary_name: "zed-remote-server-dev-0123456789ab.exe".to_string(),
+                binary_name: format!("zed-remote-server-dev-0123456789ab{expected_suffix}.exe"),
             }
         );
         assert_eq!(found.archive_extension(), "zip");
@@ -110,7 +120,10 @@ mod tests {
         std::fs::write(bundle_dir.join("zed-remote-server-linux-x86_64.gz"), b"gz").unwrap();
         let found = smol::block_on(BundledServer::find(linux, exe_dir.path(), SHA))
             .expect("the Linux server is shipped");
-        assert_eq!(found.binary_name, "zed-remote-server-dev-0123456789ab");
+        assert_eq!(
+            found.binary_name,
+            format!("zed-remote-server-dev-0123456789ab{expected_suffix}")
+        );
         assert_eq!(found.archive_extension(), "gz");
 
         // Without a commit, a server can't be told apart from other builds' ones.
