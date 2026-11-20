@@ -1451,7 +1451,7 @@ impl ToolCall {
             sandbox_fallback_authorization_details,
             sandbox_not_applied,
         };
-        result.update_raw_output_content(&language_registry, cx);
+        result.update_output_content(&language_registry, cx);
         Ok(result)
     }
 
@@ -1560,7 +1560,8 @@ impl ToolCall {
             raw_output,
             meta,
         } = patch;
-        let output_changed = !content.is_undefined() || !raw_output.is_undefined();
+        let output_changed =
+            !content.is_undefined() || !raw_output.is_undefined() || !kind.is_undefined();
         // Completion remains authoritative even when output cannot be displayed;
         // otherwise a finished tool could leave its permission request waiting.
         self.apply_reported_status(status);
@@ -1711,7 +1712,7 @@ impl ToolCall {
             self.raw_output = raw_output.take();
         }
         if output_changed {
-            self.update_raw_output_content(&language_registry, cx);
+            self.update_output_content(&language_registry, cx);
         }
         Ok(())
     }
@@ -1733,7 +1734,6 @@ impl ToolCall {
                 self.structured_content.last_mut()
             && block.append_plain_text(text, cx)
         {
-            self.update_raw_output_content(language_registry, cx);
             return;
         }
         self.structured_content.push(ToolCallContent::from_prepared(
@@ -1741,31 +1741,50 @@ impl ToolCall {
             language_registry,
             cx,
         ));
-        self.update_raw_output_content(language_registry, cx);
+        self.update_output_content(language_registry, cx);
     }
 
-    fn update_raw_output_content(
-        &mut self,
-        language_registry: &Arc<LanguageRegistry>,
-        cx: &mut App,
-    ) {
+    fn update_output_content(&mut self, language_registry: &Arc<LanguageRegistry>, cx: &mut App) {
+        let command_output = self.kind() == &acp_v2::ToolKind::Execute;
         if !self.structured_content.is_empty() {
             self.raw_output_content = None;
+            for content in &self.structured_content {
+                if let ToolCallContent::ContentBlock { block, .. } = content
+                    && let Some(acp_v2::ContentBlock::Text(_)) = &block.source
+                    && let Some(markdown) = block.markdown()
+                {
+                    markdown.update(cx, |markdown, cx| {
+                        markdown.set_parse_links_only(command_output, cx);
+                    });
+                }
+            }
             return;
         }
         let Some(text) = self.raw_output.as_ref().and_then(raw_output_text) else {
             self.raw_output_content = None;
             return;
         };
+        let parse_links_only = command_output
+            && self
+                .raw_output
+                .as_ref()
+                .is_some_and(|value| value.is_string());
         if let Some(markdown) = self
             .raw_output_content
             .as_deref()
             .and_then(ToolCallContent::markdown)
         {
+            markdown.update(cx, |markdown, cx| {
+                markdown.set_parse_links_only(parse_links_only, cx);
+            });
             update_markdown_in_place(markdown, &text, cx);
         } else {
-            let markdown =
-                cx.new(|cx| Markdown::new_deferred(text, Some(language_registry.clone()), cx));
+            let markdown = cx.new(|cx| {
+                let mut markdown =
+                    Markdown::new_deferred(text, Some(language_registry.clone()), cx);
+                markdown.set_parse_links_only(parse_links_only, cx);
+                markdown
+            });
             self.raw_output_content = Some(Box::new(ToolCallContent::ContentBlock {
                 block: ContentBlock::from_markdown(markdown),
                 meta: None,
@@ -6198,7 +6217,7 @@ impl AcpThread {
         };
         call.structured_content.clear();
         call.structured_content.push(content);
-        call.update_raw_output_content(&languages, cx);
+        call.update_output_content(&languages, cx);
         cx.emit(AcpThreadEvent::EntryUpdated(index));
         Ok(())
     }

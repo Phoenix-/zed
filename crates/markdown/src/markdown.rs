@@ -751,6 +751,13 @@ impl Markdown {
         )
     }
 
+    pub fn set_parse_links_only(&mut self, parse_links_only: bool, cx: &mut Context<Self>) {
+        if self.options.parse_links_only != parse_links_only {
+            self.options.parse_links_only = parse_links_only;
+            self.parse(cx);
+        }
+    }
+
     fn is_code_block_wrapped(&self, id: usize) -> bool {
         self.wrapped_code_blocks.contains(&id)
     }

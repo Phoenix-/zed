@@ -12908,6 +12908,7 @@ pub(crate) mod tests {
         let thread_view = active_thread(&conversation_view, cx);
         let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
         let tool_id = acp_v2::ToolCallId::new("execute-text-disclosure");
+        let command_output = "# Files\n\nPath    Count\n----    -----\n[cache]     5";
         thread.update(cx, |thread, cx| {
             thread
                 .handle_session_update(
@@ -12915,7 +12916,7 @@ pub(crate) mod tests {
                         acp_v1::ToolCall::new("execute-text-disclosure", "echo hello\necho second")
                             .kind(acp_v1::ToolKind::Execute)
                             .status(acp_v1::ToolCallStatus::InProgress)
-                            .content(vec!["hello output".into()]),
+                            .content(vec![command_output.into()]),
                     ),
                     cx,
                 )
@@ -12944,11 +12945,31 @@ pub(crate) mod tests {
             cx.debug_bounds("command-preview-inner-tool-call-header-0")
                 .is_none()
         );
-        assert!(
-            cx.debug_bounds("command-full-inner-tool-call-header-0")
-                .is_some()
-        );
+        let command_block = cx
+            .debug_bounds("command-full-inner-tool-call-header-0")
+            .expect("expanded command block");
         assert!(cx.debug_bounds("tool-call-output-0-0").is_some());
+        let output_block = cx.debug_bounds("command-output-0-0").expect("output block");
+        assert_eq!(output_block.left(), command_block.left());
+        assert_eq!(output_block.right(), command_block.right());
+        assert_eq!(output_block.top(), command_block.bottom());
+        let copy = cx.debug_bounds("ICON-Copy").expect("copy command button");
+        let disclosure = cx
+            .debug_bounds("command-card-disclosure-0")
+            .expect("command disclosure");
+        let status = cx
+            .debug_bounds("command-card-status-0")
+            .expect("command status");
+        assert_eq!(copy.center().y, disclosure.center().y);
+        assert_eq!(disclosure.center().y, status.center().y);
+        let output = thread.read_with(cx, |thread, _| {
+            let (_, call) = thread.tool_call(&tool_id).expect("tool call");
+            call.content()[0].markdown().expect("text output").clone()
+        });
+        let rendered = markdown::MarkdownElement::rendered_text(output, cx, |window, cx| {
+            MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx)
+        });
+        assert_eq!(rendered, command_output);
         let bounds = cx
             .debug_bounds("command-card-disclosure-0")
             .expect("visible disclosure");

@@ -435,6 +435,17 @@ fn parse_cat_numbered_code(code: &str) -> Option<ParsedCatNumberedCode> {
     })
 }
 
+fn command_card_text_style(window: &Window, cx: &App) -> MarkdownStyle {
+    let mut style =
+        MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx);
+    style.container_style.text.font_size = Some(rems_from_px(12_f32).into());
+    style.container_style.text.line_height = Some(rems_from_px(17_f32).into());
+    style.height_is_multiple_of_line_height = true;
+    // Wrap long lines so their continuation keeps the padding of the card.
+    style.code_block_overflow_x_scroll = false;
+    style
+}
+
 fn command_preview_text(command: &str) -> String {
     match command.split_once('\n') {
         Some((first, _)) => format!("{}…", strip_line_ending(first)),
@@ -9436,9 +9447,9 @@ impl ThreadView {
     fn render_collapsible_command(
         &self,
         group: SharedString,
-        is_preview: bool,
         collapsed: bool,
         command: Entity<Markdown>,
+        actions: Option<Div>,
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
@@ -9454,7 +9465,7 @@ impl ThreadView {
         if collapsed {
             let first_line = command_preview_text(&command_text);
             let selector = format!("command-preview-{group}");
-            return div()
+            let preview = div()
                 .debug_selector(move || selector.clone())
                 .min_w_0()
                 .overflow_hidden()
@@ -9465,33 +9476,17 @@ impl ThreadView {
                         .size(LabelSize::Small)
                         .truncate(),
                 );
+            return if let Some(actions) = actions {
+                h_flex()
+                    .w_full()
+                    .child(div().flex_1().min_w_0().child(preview))
+                    .child(actions)
+            } else {
+                preview
+            };
         }
 
-        let mut style =
-            MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx);
-        style.container_style.text.font_size = Some(rems_from_px(12_f32).into());
-        style.container_style.text.line_height = Some(rems_from_px(17_f32).into());
-        style.height_is_multiple_of_line_height = true;
-        // Soft-wrap the command instead of horizontally scrolling it: the card is
-        // narrow, and in scroll mode a long command wraps anyway but its wrapped
-        // lines don't pick up the code block's left padding. Wrap mode lays the
-        // text out as a normal block inside the padded content box, so every
-        // line (wrapped or not) is padded consistently.
-        style.code_block_overflow_x_scroll = false;
-
-        let header_bg = self.tool_card_header_bg(cx);
-        let run_command_label = if is_preview {
-            Some(
-                h_flex().h_6().child(
-                    Label::new("Run Command")
-                        .buffer_font(cx)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-            )
-        } else {
-            None
-        };
+        let style = command_card_text_style(window, cx);
         // Suppress the code block's built-in copy button so we don't stack two
         // copy buttons on top of each other; the outer button below is the one
         // we want, because it copies the unfenced command text.
@@ -9508,15 +9503,33 @@ impl ThreadView {
             .visible_on_hover(group.clone());
 
         let selector = format!("command-full-{group}");
-        v_flex()
+        let block = v_flex()
             .debug_selector(move || selector.clone())
             .group(group)
             .relative()
             .p_1p5()
-            .bg(header_bg)
-            .when(is_preview, |this| this.pt_1().children(run_command_label))
-            .child(markdown_element)
-            .child(div().absolute().top_1().right_1().child(copy_button))
+            .bg(self.tool_card_header_bg(cx));
+        if let Some(actions) = actions {
+            block
+                .pt_1()
+                .child(
+                    h_flex()
+                        .h_6()
+                        .justify_between()
+                        .child(
+                            Label::new("Run Command")
+                                .buffer_font(cx)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(h_flex().gap_1().child(copy_button).child(actions)),
+                )
+                .child(markdown_element)
+        } else {
+            block
+                .child(markdown_element)
+                .child(div().absolute().top_1().right_1().child(copy_button))
+        }
     }
 
     fn render_terminal_tool_call(
@@ -9590,9 +9603,9 @@ impl ThreadView {
             .is_tool_call_expanded(&tool_call.id);
         let command_element = self.render_collapsible_command(
             header_group.clone(),
-            false,
             !is_expanded && !needs_confirmation,
             tool_call.label.clone(),
+            None,
             window,
             cx,
         );
@@ -10184,14 +10197,6 @@ impl ThreadView {
         };
 
         let command_header = || {
-            let command = self.render_collapsible_command(
-                card_header_id.clone(),
-                true,
-                !is_open && !needs_confirmation,
-                tool_call.label.clone(),
-                window,
-                cx,
-            );
             let disclosure = (!needs_confirmation).then(|| {
                 let icon = if is_open {
                     IconName::ChevronUp
@@ -10222,41 +10227,34 @@ impl ThreadView {
                     .debug_selector(move || format!("command-card-disclosure-{entry_ix}"))
                     .child(button)
             });
-            h_flex()
-                .w_full()
-                .items_center()
-                .child(div().flex_1().min_w_0().child(command))
-                .children(disclosure)
-                .when(failed_or_canceled, |row| {
-                    row.child(
-                        Icon::new(IconName::Close)
-                            .color(Color::Error)
-                            .size(IconSize::Small),
-                    )
-                })
-                .when(
-                    matches!(
-                        tool_call.status(),
-                        ToolCallStatus::InProgress | ToolCallStatus::Pending
-                    ),
-                    |row| {
-                        row.child(
-                            Icon::new(IconName::LoadCircle)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
-                    },
-                )
-                .when(
-                    matches!(tool_call.status(), ToolCallStatus::Completed),
-                    |row| {
-                        row.child(
-                            Icon::new(IconName::Check)
-                                .size(IconSize::Small)
-                                .color(Color::Success),
-                        )
-                    },
-                )
+            let status_icon = match tool_call.status() {
+                ToolCallStatus::Rejected | ToolCallStatus::Canceled | ToolCallStatus::Failed => {
+                    Some((IconName::Close, Color::Error))
+                }
+                ToolCallStatus::InProgress | ToolCallStatus::Pending => {
+                    Some((IconName::LoadCircle, Color::Muted))
+                }
+                ToolCallStatus::Completed => Some((IconName::Check, Color::Success)),
+                _ => None,
+            };
+            let actions =
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .children(disclosure)
+                    .children(status_icon.map(|(icon, color)| {
+                        div()
+                            .debug_selector(move || format!("command-card-status-{entry_ix}"))
+                            .child(Icon::new(icon).color(color).size(IconSize::Small))
+                    }));
+            self.render_collapsible_command(
+                card_header_id.clone(),
+                !is_open && !needs_confirmation,
+                tool_call.label.clone(),
+                Some(actions),
+                window,
+                cx,
+            )
         };
         let body = v_flex()
             .map(|this| {
@@ -12328,6 +12326,18 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
+        if tool_call.kind() == &acp_v2::ToolKind::Execute {
+            return div()
+                .debug_selector(move || format!("command-output-{entry_ix}-{context_ix}"))
+                .w_full()
+                .border_t_1()
+                .border_color(self.tool_card_border_color(cx))
+                .p_1p5()
+                .bg(self.tool_card_header_bg(cx))
+                .child(self.render_markdown(markdown, command_card_text_style(window, cx), cx))
+                .into_any_element();
+        }
+
         let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
         let output = self
             .render_numbered_read_file_output(
